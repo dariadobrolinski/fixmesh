@@ -5,9 +5,11 @@ from collections import defaultdict
 import pymeshfix
 from scipy import sparse
 from scipy.sparse.linalg import splu
+from scipy.spatial import cKDTree
 
 def cut_repair(mesh, max_patch_edge_multiplier=1.6, fairing="membrane",
-               max_passes=10, max_widening=3):
+               refine_patches=False, base_widening=0, max_passes=20,
+               max_widening=3):
     """
     Removes intersecting faces and fills the open boundaries left behind,
     keeping only the number of major components that existed before cutting.
@@ -26,7 +28,7 @@ def cut_repair(mesh, max_patch_edge_multiplier=1.6, fairing="membrane",
         max_patch_edge_multiplier (float): Maximum edge length in newly
             patched regions, expressed as a multiple of the input mesh's
             median edge length. The paper uses 1.6 for its optional
-            long-edge refinement.
+            long edge refinement.
         fairing (str): How to reshape each refined patch, which is otherwise
             left as the flat disc PyMeshFix produced - refinement alone
             changes a patch's triangle count but not its shape.
@@ -34,13 +36,54 @@ def cut_repair(mesh, max_patch_edge_multiplier=1.6, fairing="membrane",
             "thin_plate" for the surface that also meets the rim tangentially
             (smoother, but it overshoots on large holes and drives the patch
             through nearby cortex), and "none" leaves the flat disc alone.
-        max_passes (int): Upper bound on cut-and-patch passes.
-        max_widening (int): A handful of intersections can survive every pass,
-            because the patch keeps being laid back through the same tight
-            spot. When a pass fails to make progress the cut is widened by an
-            extra ring of faces around each intersection, giving the next
-            patch room to route around the obstruction. This caps how many
-            rings may be added before iteration gives up.
+        max_passes (int): Upper bound on cut-and-patch passes. With
+            base_widening=0 (the default), convergence has taken 14 passes on
+            the two-hemisphere test mesh - the tight cut occasionally needs a
+            couple of rounds of stall-triggered widening (see max_widening)
+            before it settles.
+        refine_patches (bool): After everything else converges, re-fair (and
+            then re-triangulate to a finer edge length before fairing again)
+            the entire accumulated patch - every face introduced by any pass,
+            found the same way `fairing` finds it above - as one continuous
+            surface. This is meant for a patch spanning a narrow, elongated
+            hole, which has almost no interior to average over at the usual
+            triangle scale, so membrane fairing there still reads as a sharp
+            fold rather than a rounded valley. It is a real cost, not a free
+            cleanup pass: membrane fairing is a minimal-surface solve, so it
+            shrinks whatever it touches toward less area, and "the entire
+            accumulated patch" can be a large share of the cortex, including
+            plenty of patches that were never sharp to begin with. Off by
+            default; turn it on only if residual sharp folds matter more than
+            the shrinkage this causes everywhere it runs. Never touches an
+            original, unpatched vertex's position.
+        base_widening (int): Rings of extra faces taken around every
+            self-intersection, even on a pass that isn't stalled. Removing
+            exactly the flagged faces tends to leave a jagged, slit-shaped
+            boundary - the self-intersection test is a pairwise, local check,
+            not an estimate of the hole's true shape - and patching a slit
+            produces a sharp blade no matter how the patch is refined
+            afterwards, because the blade is baked into the boundary that
+            patching never moves. A rounder starting cut avoids some of that,
+            but every extra ring is real tissue removed unconditionally, on
+            every cut, so this trades anatomical fidelity for smoothness
+            directly: 0 keeps the cut as tight as possible; each ring above 0
+            costs surface area and widens gaps between nearby components in
+            exchange for fewer sharp folds later.
+        max_widening (int): On top of `base_widening`, if a pass still fails
+            to make progress against a stubborn intersection, the margin
+            grows by a further ring. This caps how many extra rings may be
+            added before iteration gives up.
+
+    A tight spot - most often the narrow channel between two components,
+    such as the interhemispheric fissure - can need several passes in a row.
+    Each of those passes only knows about the patch the previous pass left,
+    not the true cortex beneath it, so the patches stack up and the result
+    reads as rough or spiky even though it is watertight and intersection
+    free. Once the loop converges, every face introduced across all passes
+    is therefore re-faired once more as a single patch relative to the
+    original, untouched cortex - not the intermediate per-pass rims - which
+    removes that compounding. The convergence loop then runs again in case
+    that reshaping reopened an intersection.
 
     Returns:
         trimesh.Trimesh: Repaired, watertight mesh, free of self-intersections
@@ -52,37 +95,60 @@ def cut_repair(mesh, max_patch_edge_multiplier=1.6, fairing="membrane",
     if max_passes < 1:
         raise ValueError("max_passes must be at least 1")
 
-    # Measured once, on the input, so that every pass keeps the same component
-    # budget and refines to the same target rather than drifting with each
-    # pass's own statistics.
+    # Removes duplicated vertices once up front.
+    # Records the number of components before cutting.
     mesh, _ = pymesh.remove_duplicated_vertices(mesh)
     count = _count_num_components(mesh)
+
+    # Computes the edge length from the input's median edge length.
+    # This ensures that filled patches are refined to the same scale!
     target_edge_length = (
         _compute_median_edge_length(mesh) * max_patch_edge_multiplier
     )
 
+    # Loop to detect intersections and then cut + patch those interesections
     current = mesh
     previous_intersections = None
     widening = 0
+    refaired = False
+    patch_refined = False
     for pass_index in range(1, max_passes + 1):
         intersecting_faces = pymesh.detect_self_intersection(current)
         remaining = len(intersecting_faces)
         print(f"Pass {pass_index}: {remaining} self-intersecting face pairs.")
         if remaining == 0:
+            if refine_patches and fairing != "none" and not refaired:
+                print("  Converged; re-fairing the accumulated patch as one surface.")
+                current = _refair_accumulated_patch(current, mesh, fairing)
+                refaired = True
+                previous_intersections = None
+                widening = 0
+                continue
+            if refine_patches and not patch_refined:
+                print("  Converged; refining the accumulated patch to finer resolution.")
+                current = _refine_accumulated_patch(
+                    current, mesh, target_edge_length, fairing
+                )
+                patch_refined = True
+                previous_intersections = None
+                widening = 0
+                continue
             break
         if previous_intersections is not None and remaining >= previous_intersections:
             widening += 1
             if widening > max_widening:
                 print("Widening exhausted; stopping.")
                 break
-            print(f"  No progress; widening the cut by {widening} ring(s).")
+            print(f"  No progress; widening the cut by {widening} extra ring(s).")
         else:
             widening = 0
         previous_intersections = remaining
 
         result = _cut_repair_pass(
             current,
-            _widen_selection(current, intersecting_faces.flatten(), widening),
+            _widen_selection(
+                current, intersecting_faces.flatten(), base_widening + widening
+            ),
             count,
             target_edge_length,
             fairing,
@@ -94,11 +160,85 @@ def cut_repair(mesh, max_patch_edge_multiplier=1.6, fairing="membrane",
     else:
         print(f"Reached max_passes={max_passes} with intersections remaining.")
 
-    return _pymesh_to_trimesh(current)
+    # The final state may have come from _refair_accumulated_patch or
+    # _refine_accumulated_patch rather than a plain _cut_repair_pass, and
+    # only the latter swept degenerate slivers - so do it once more here
+    # regardless of which step produced the returned mesh.
+    final_mesh = _pymesh_to_trimesh(current)
+    final_mesh.update_faces(final_mesh.nondegenerate_faces())
+    final_mesh.remove_unreferenced_vertices()
+    return final_mesh
+
+
+def _classify_repair_faces(vertices, faces, original_vertices, original_faces, tol=1e-4):
+    # Which faces are new since the very first cut, regardless of which
+    # pass introduced them or how many times that spot has been repatched.
+    tree = cKDTree(original_vertices)
+    distance, nearest = tree.query(vertices, k=1)
+    matched_vertex = distance < tol
+    original_face_set = set(map(tuple, np.sort(original_faces, axis=1)))
+
+    all_matched = matched_vertex[faces].all(axis=1)
+    is_original = np.zeros(len(faces), dtype=bool)
+    candidates = np.flatnonzero(all_matched)
+    nearest_ids = np.sort(nearest[faces[candidates]], axis=1)
+    is_original[candidates] = [
+        tuple(row) in original_face_set for row in nearest_ids
+    ]
+    return ~is_original
+
+
+def _refair_accumulated_patch(current, original_mesh, fairing_mode):
+    # Cleans up mesh, removing any spiky/sharp edges.
+    vertices = np.asarray(current.vertices, dtype=float)
+    faces = np.asarray(current.faces, dtype=np.int64)
+    patch_faces = _classify_repair_faces(
+        vertices, faces, original_mesh.vertices, original_mesh.faces
+    )
+    if not np.any(patch_faces):
+        return current
+    faired = _fair_patch_vertices(vertices, faces, patch_faces, mode=fairing_mode)
+    print(f"  Re-faired {int(np.count_nonzero(patch_faces))} accumulated patch faces.")
+    result, _ = pymesh.remove_duplicated_vertices(
+        pymesh.form_mesh(faired, faces)
+    )
+    return result
+
+
+def _refine_accumulated_patch(current, original_mesh, target_edge_length,
+                              fairing_mode, shrink=2.0):
+    # Chops patches into smaller triangles and refines them.
+    vertices = np.asarray(current.vertices, dtype=float)
+    faces = np.asarray(current.faces, dtype=np.int64)
+    patch_faces = _classify_repair_faces(
+        vertices, faces, original_mesh.vertices, original_mesh.faces
+    )
+    if not np.any(patch_faces):
+        return current
+    print(f"  {int(np.count_nonzero(patch_faces))} accumulated patch faces "
+          f"will be refined and re-faired.")
+
+    fine_target = target_edge_length / shrink
+    vertices, faces, patch_faces = _refine_patch_faces(
+        trimesh.Trimesh(vertices=vertices, faces=faces, process=False),
+        patch_faces,
+        fine_target,
+    )
+    if fairing_mode != "none":
+        vertices = _fair_patch_vertices(
+            vertices, faces, patch_faces, mode=fairing_mode
+        )
+    result, _ = pymesh.remove_duplicated_vertices(
+        pymesh.form_mesh(vertices, faces)
+    )
+    return result
 
 
 def _widen_selection(mesh, face_ids, rings):
-    """Grow a face selection by whole vertex one-rings."""
+    # Gets a list of self interesecting triangles
+    # Gows that selection outward by rings steps.
+    # Cuts those flagged triangles.
+    # Widening selection allows for a cleaner patch.
     selected = np.zeros(mesh.num_faces, dtype=bool)
     selected[face_ids] = True
     for _ in range(rings):
@@ -109,7 +249,7 @@ def _widen_selection(mesh, face_ids, rings):
 
 
 def _cut_repair_pass(mesh, intersecting_faces, count, target_edge_length, fairing):
-    """One cut-and-patch cycle: drop intersecting faces, refill the holes."""
+    # 1 cut and patch cycle: drop intersecting faces, refill the holes.
 
     # Step 1: Remove self-intersecting faces
     unique_faces = np.setdiff1d(np.arange(mesh.num_faces), intersecting_faces)
@@ -151,7 +291,7 @@ def _cut_repair_pass(mesh, intersecting_faces, count, target_edge_length, fairin
 
 
 def _canonical_face_rows(mesh, decimals=6):
-    """Represent triangle geometry independently of vertex and face order."""
+    # Allows us to identify each triangle
     triangles = np.round(mesh.vertices[mesh.faces], decimals=decimals)
     order = np.lexsort(
         (triangles[:, :, 2], triangles[:, :, 1], triangles[:, :, 0]),
@@ -163,28 +303,16 @@ def _canonical_face_rows(mesh, decimals=6):
 
 
 def _find_new_faces(filled, cut_component):
-    """Return a mask for faces introduced while patching a cut component."""
+    # Find new triangles and id them/
     original_faces = _canonical_face_rows(cut_component)
     filled_faces = _canonical_face_rows(filled)
     return ~np.isin(filled_faces, original_faces)
 
 
 def _refine_patch_faces(mesh, patch_faces, target_edge_length, max_iters=20):
-    """Subdivide oversized patch edges while maintaining a conforming mesh.
-
-    A marked edge is split in every incident triangle, not just in the patch
-    triangle that asked for the split. This matters at the boundary between
-    an original face and a patch: refining only the patch side would leave a
-    T-junction and make the result non-watertight.
-
-    Existing vertices are never moved, so cortical geometry outside the
-    patched holes is bit-for-bit unchanged and each patch stays within the
-    plane PyMeshFix chose for it. Moving the new vertices towards the pre-cut
-    surface was tried and rejected: near a repaired hole the original mesh
-    holds both banks of the sulcus that self-intersected, so a closest-point
-    query pulls neighbouring vertices onto opposite banks and folds the patch
-    through itself.
-    """
+    # Subdivides any patch edge longer than the target, conformingly:
+    # If an edge is shared by a patch triangle and a non-patch triangle,
+    # Both get split, not just one side.
     if not np.any(patch_faces):
         return (
             np.asarray(mesh.vertices, dtype=float),
@@ -275,7 +403,7 @@ def _refine_patch_faces(mesh, patch_faces, target_edge_length, max_iters=20):
 
 
 def _free_patch_vertices(faces, patch_faces, num_vertices):
-    """Vertices strictly interior to a patch: used by no original face."""
+    # Marks a vertex as free to move only if every triangle touching it is patch material
     inside = np.zeros(num_vertices, dtype=bool)
     inside[faces[patch_faces].ravel()] = True
     outside = np.zeros(num_vertices, dtype=bool)
@@ -284,7 +412,7 @@ def _free_patch_vertices(faces, patch_faces, num_vertices):
 
 
 def _umbrella_laplacian(faces, num_vertices):
-    """Row-normalised uniform Laplacian over the whole mesh."""
+    # Find the average of free point's neighbours to find new position (to smooth)
     edges = np.vstack((faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]))
     edges = np.unique(np.vstack((edges, edges[:, ::-1])), axis=0)
     rows, cols = edges[:, 0], edges[:, 1]
@@ -298,24 +426,7 @@ def _umbrella_laplacian(faces, num_vertices):
 
 def _fair_patch_vertices(vertices, faces, patch_faces, mode="membrane",
                          regularisation=1e-8):
-    """Bend a flat cap into a smooth continuation of the surrounding cortex.
-
-    PyMeshFix closes every hole with a planar disc, and subdividing that disc
-    leaves its shape untouched - the repair still reads as a flat sheet across
-    the sulcus. Instead the interior patch vertices are solved for, with every
-    vertex that an original cortical face touches pinned. Because the pinned
-    set contains the whole hole rim and the cortex behind it, the rim stays
-    exactly where it was.
-
-    "membrane" solves L x = 0, giving the minimal surface spanning the rim.
-    "thin_plate" minimises ||L x||^2, which additionally meets the rim
-    tangentially but overshoots across wide holes, inflating the patch until
-    it intersects neighbouring cortex.
-
-    Unlike projecting towards the pre-cut surface, neither mode consults the
-    self-intersecting geometry that caused the hole, so adjacent vertices
-    cannot be dragged onto opposite banks of the same sulcus.
-    """
+    # Moves the position of free points to create smooth, curved surface.
     if mode not in ("membrane", "thin_plate"):
         raise ValueError(f"unknown fairing mode {mode!r}")
 
