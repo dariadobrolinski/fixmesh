@@ -1,3 +1,4 @@
+import os
 import trimesh
 import numpy as np
 import pymesh
@@ -7,87 +8,36 @@ from scipy import sparse
 from scipy.sparse.linalg import splu
 from scipy.spatial import cKDTree
 
-def cut_repair(mesh, max_patch_edge_multiplier=1.6, fairing="membrane",
+def cut_repair(mesh, max_patch_edge_multiplier=1.6, fairing="smoothing",
                refine_patches=False, base_widening=0, max_passes=20,
-               max_widening=3):
+               max_widening=3, output_directory=None, output_filename=None):
     """
-    Removes intersecting faces and fills the open boundaries left behind,
-    keeping only the number of major components that existed before cutting.
+    Repair a mesh by removing intersecting faces and filling the holes.
 
-    A single cut-and-patch pass does not finish the job. The patches are built
-    without any knowledge of the rest of the mesh, so a patch can be laid
-    straight through nearby cortex - or, when the input has several
-    components, straight through a different component, since each one is
-    patched in isolation. The cycle is therefore repeated on its own output
-    until no self-intersection is left. On a two-hemisphere brain mesh this
-    takes about five passes, and the hemispheres stop intersecting each other
-    on the second; almost all of the surface loss happens in the first pass.
+    The repair repeats until no intersections remain or max_passes is
+    reached. It keeps the same number of main components as the input.
 
     Args:
-        mesh (pymesh.Mesh): Input mesh, possibly with self-intersections.
-        max_patch_edge_multiplier (float): Maximum edge length in newly
-            patched regions, expressed as a multiple of the input mesh's
-            median edge length. The paper uses 1.6 for its optional
-            long edge refinement.
-        fairing (str): How to reshape each refined patch, which is otherwise
-            left as the flat disc PyMeshFix produced - refinement alone
-            changes a patch's triangle count but not its shape.
-            "membrane" solves for the minimal surface spanning the hole rim,
-            "thin_plate" for the surface that also meets the rim tangentially
-            (smoother, but it overshoots on large holes and drives the patch
-            through nearby cortex), and "none" leaves the flat disc alone.
-        max_passes (int): Upper bound on cut-and-patch passes. With
-            base_widening=0 (the default), convergence has taken 14 passes on
-            the two-hemisphere test mesh - the tight cut occasionally needs a
-            couple of rounds of stall-triggered widening (see max_widening)
-            before it settles.
-        refine_patches (bool): After everything else converges, re-fair (and
-            then re-triangulate to a finer edge length before fairing again)
-            the entire accumulated patch - every face introduced by any pass,
-            found the same way `fairing` finds it above - as one continuous
-            surface. This is meant for a patch spanning a narrow, elongated
-            hole, which has almost no interior to average over at the usual
-            triangle scale, so membrane fairing there still reads as a sharp
-            fold rather than a rounded valley. It is a real cost, not a free
-            cleanup pass: membrane fairing is a minimal-surface solve, so it
-            shrinks whatever it touches toward less area, and "the entire
-            accumulated patch" can be a large share of the cortex, including
-            plenty of patches that were never sharp to begin with. Off by
-            default; turn it on only if residual sharp folds matter more than
-            the shrinkage this causes everywhere it runs. Never touches an
-            original, unpatched vertex's position.
-        base_widening (int): Rings of extra faces taken around every
-            self-intersection, even on a pass that isn't stalled. Removing
-            exactly the flagged faces tends to leave a jagged, slit-shaped
-            boundary - the self-intersection test is a pairwise, local check,
-            not an estimate of the hole's true shape - and patching a slit
-            produces a sharp blade no matter how the patch is refined
-            afterwards, because the blade is baked into the boundary that
-            patching never moves. A rounder starting cut avoids some of that,
-            but every extra ring is real tissue removed unconditionally, on
-            every cut, so this trades anatomical fidelity for smoothness
-            directly: 0 keeps the cut as tight as possible; each ring above 0
-            costs surface area and widens gaps between nearby components in
-            exchange for fewer sharp folds later.
-        max_widening (int): On top of `base_widening`, if a pass still fails
-            to make progress against a stubborn intersection, the margin
-            grows by a further ring. This caps how many extra rings may be
-            added before iteration gives up.
-
-    A tight spot - most often the narrow channel between two components,
-    such as the interhemispheric fissure - can need several passes in a row.
-    Each of those passes only knows about the patch the previous pass left,
-    not the true cortex beneath it, so the patches stack up and the result
-    reads as rough or spiky even though it is watertight and intersection
-    free. Once the loop converges, every face introduced across all passes
-    is therefore re-faired once more as a single patch relative to the
-    original, untouched cortex - not the intermediate per-pass rims - which
-    removes that compounding. The convergence loop then runs again in case
-    that reshaping reopened an intersection.
+        mesh (pymesh.Mesh): Mesh to repair.
+        max_patch_edge_multiplier (float): Maximum patch edge length,
+            measured against the input mesh's median edge length.
+        fairing (str): "smoothing"smooths new patches. "none"
+            keeps their original shape. Both options still split long edges.
+        refine_patches (bool): Make all completed patches finer and smooth
+            them together. This may shrink large repaired areas.
+        base_widening (int): Extra face rings removed around every
+            intersection. Larger values create wider, smoother cuts but
+            remove more of the original surface.
+        max_passes (int): Maximum number of repair passes.
+        max_widening (int): Maximum extra widening used when repair stalls.
+        output_directory (str): Folder to save the result into. Set this
+            (with output_filename) to have the repaired mesh written to
+            disk before it's returned. Leave both as None to skip saving.
+        output_filename (str): File name for the saved result, e.g.
+            "repaired.stl". Set this together with output_directory.
 
     Returns:
-        trimesh.Trimesh: Repaired, watertight mesh, free of self-intersections
-        unless max_passes was reached first.
+        trimesh.Trimesh: The repaired mesh.
     """
 
     if max_patch_edge_multiplier <= 0:
@@ -167,6 +117,13 @@ def cut_repair(mesh, max_patch_edge_multiplier=1.6, fairing="membrane",
     final_mesh = _pymesh_to_trimesh(current)
     final_mesh.update_faces(final_mesh.nondegenerate_faces())
     final_mesh.remove_unreferenced_vertices()
+
+    if output_directory and output_filename:
+        os.makedirs(output_directory, exist_ok=True)
+        output_path = os.path.join(output_directory, output_filename)
+        final_mesh.export(output_path)
+        print(f"Saved repaired mesh to {output_path}")
+
     return final_mesh
 
 
@@ -424,10 +381,9 @@ def _umbrella_laplacian(faces, num_vertices):
     return adjacency - sparse.identity(num_vertices, format="csr")
 
 
-def _fair_patch_vertices(vertices, faces, patch_faces, mode="membrane",
-                         regularisation=1e-8):
+def _fair_patch_vertices(vertices, faces, patch_faces, mode="smoothing"):
     # Moves the position of free points to create smooth, curved surface.
-    if mode not in ("membrane", "thin_plate"):
+    if mode != "smoothing":
         raise ValueError(f"unknown fairing mode {mode!r}")
 
     vertices = np.asarray(vertices, dtype=float)
@@ -440,14 +396,8 @@ def _fair_patch_vertices(vertices, faces, patch_faces, mode="membrane",
     free_ids = np.flatnonzero(free)
     pinned = np.where(free[:, None], 0.0, vertices)
 
-    if mode == "membrane":
-        system = laplacian[free_ids][:, free_ids].tocsc()
-        rhs = -(laplacian[free_ids] @ pinned)
-    else:
-        lhs = laplacian[:, free_ids]
-        system = (lhs.T @ lhs).tocsc()
-        system += regularisation * sparse.identity(len(free_ids), format="csc")
-        rhs = lhs.T @ -(laplacian @ pinned)
+    system = laplacian[free_ids][:, free_ids].tocsc()
+    rhs = -(laplacian[free_ids] @ pinned)
 
     factor = splu(system)
     faired = vertices.copy()
@@ -456,7 +406,7 @@ def _fair_patch_vertices(vertices, faces, patch_faces, mode="membrane",
     )
     shift = np.linalg.norm(faired[free_ids] - vertices[free_ids], axis=1)
     print(
-        f"  Faired {len(free_ids)} patch vertices with {mode} "
+        f"  Faired {len(free_ids)} patch vertices "
         f"(median shift {np.median(shift):.3f}, max {shift.max():.3f})."
     )
     return faired
