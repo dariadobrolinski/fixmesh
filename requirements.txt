@@ -1,0 +1,13 @@
+# This dependency set targets Python 3.10 (see pymesh_env.yml).
+# PyMesh/PyMesh2 and these pinned scientific packages are not Python 3.13 compatible.
+numpy==1.26.4
+scipy==1.14.1
+trimesh==4.5.3
+pymesh2==0.3
+pymeshfix==0.17.0
+meshlib==3.0.2.183
+open3d==0.18.0
+pyvista==0.44.2
+matplotlib==3.10.0
+ipython==8.31.0
+tabulate==0.9.0
