@@ -11,7 +11,7 @@ from scipy.spatial import cKDTree
 def cut_repair(mesh, max_patch_edge_multiplier=1.6, fairing="smoothing",
                refine_patches=False, base_widening=0, max_passes=20,
                max_widening=3, output_directory=None, output_filename=None,
-               strategy="geometry_preserving"):
+               strategy="geometry_preserving", min_fragment_faces=60):
     """
     Repair a mesh by removing intersecting faces and filling the holes.
 
@@ -38,6 +38,12 @@ def cut_repair(mesh, max_patch_edge_multiplier=1.6, fairing="smoothing",
             disk before it's returned. Leave both as None to skip saving.
         output_filename (str): File name for the saved result, e.g.
             "repaired.stl". Set this together with output_directory.
+        min_fragment_faces (int): Legacy-only. Smallest offcut, measured in
+            faces, that counts as anatomy rather than debris. Cutting the
+            intersecting faces severs gyri from the surface; anything this
+            size or larger is reattached to the body it came from instead of
+            being discarded. Set to 0 for the old keep-the-largest-components
+            behavior.
         strategy (str): ``"geometry_preserving"`` keeps every original
             component and uses the original curvature to shape new patches.
             ``"legacy"`` uses the previous largest-component cut-and-cap
@@ -74,6 +80,7 @@ def cut_repair(mesh, max_patch_edge_multiplier=1.6, fairing="smoothing",
             base_widening,
             max_passes,
             max_widening,
+            min_fragment_faces,
         )
     else:
         final_mesh = _run_geometry_preserving_repair(
@@ -97,7 +104,7 @@ def cut_repair(mesh, max_patch_edge_multiplier=1.6, fairing="smoothing",
 
 def _run_legacy_cut_repair(mesh, target_edge_length, fairing,
                            refine_patches, base_widening, max_passes,
-                           max_widening):
+                           max_widening, min_fragment_faces=0):
     """Previous cut-and-cap implementation, kept for comparisons."""
     count = _count_num_components(mesh)
     current = mesh
@@ -145,6 +152,7 @@ def _run_legacy_cut_repair(mesh, target_edge_length, fairing,
             count,
             target_edge_length,
             fairing,
+            min_fragment_faces,
         )
         current = pymesh.form_mesh(
             np.asarray(result.vertices), np.asarray(result.faces)
@@ -624,7 +632,55 @@ def _widen_selection(mesh, face_ids, rings):
     return np.flatnonzero(selected)
 
 
-def _cut_repair_pass(mesh, intersecting_faces, count, target_edge_length, fairing):
+def _regroup_with_fragments(submeshes_sorted, count, min_fragment_faces):
+    """Decide which offcuts to keep, and which body each one belongs to.
+
+    Cutting the intersecting faces does not just open holes - it severs the
+    mesh, and a gyrus tangled at its base comes away as its own piece. Keeping
+    only the largest components throws those gyri out and caps the stump, which
+    is where most of the lost anatomy goes. Instead every offcut big enough to
+    be anatomy rather than debris is handed to PyMeshFix together with the body
+    it came from, so the gyrus gets bridged back on. The bridge counts as new
+    patch geometry, so it is subdivided and faired like any other patch.
+    """
+    bodies, offcuts = submeshes_sorted[:count], submeshes_sorted[count:]
+    if min_fragment_faces <= 0:
+        print(
+            f"  Found {len(submeshes_sorted)} components after cut. "
+            f"Keeping {count} largest."
+        )
+        return bodies
+
+    fragments = [m for m in offcuts if len(m.faces) >= min_fragment_faces]
+    dropped = sum(len(m.faces) for m in offcuts if len(m.faces) < min_fragment_faces)
+    if not fragments:
+        print(
+            f"  Found {len(submeshes_sorted)} components after cut. "
+            f"Keeping {count} largest; {dropped} offcut faces were debris."
+        )
+        return bodies
+
+    trees = [cKDTree(body.vertices) for body in bodies]
+    groups = [[body] for body in bodies]
+    for fragment in fragments:
+        centre = fragment.vertices.mean(axis=0)
+        nearest = int(np.argmin([tree.query(centre)[0] for tree in trees]))
+        groups[nearest].append(fragment)
+
+    print(
+        f"  Found {len(submeshes_sorted)} components after cut. Keeping "
+        f"{count} largest plus {len(fragments)} severed pieces "
+        f"({sum(len(m.faces) for m in fragments)} faces) to reattach; "
+        f"{dropped} offcut faces were debris."
+    )
+    return [
+        group[0] if len(group) == 1 else trimesh.util.concatenate(group)
+        for group in groups
+    ]
+
+
+def _cut_repair_pass(mesh, intersecting_faces, count, target_edge_length,
+                     fairing, min_fragment_faces=0):
     # 1 cut and patch cycle: drop intersecting faces, refill the holes.
 
     # Step 1: Remove self-intersecting faces
@@ -633,11 +689,12 @@ def _cut_repair_pass(mesh, intersecting_faces, count, target_edge_length, fairin
     uniq_verts, remap = np.unique(face_mask, return_inverse=True)
     cut_mesh = pymesh.form_mesh(mesh.vertices[uniq_verts], remap.reshape(-1, 3))
 
-    # Step 2: Split into submeshes (We discard small fragments here).
+    # Step 2: Split into submeshes, then decide what to do with the offcuts.
     submeshes = _pymesh_to_trimesh(cut_mesh).split(only_watertight=False)
     submeshes_sorted = sorted(submeshes, key=lambda m: len(m.vertices), reverse=True)
-    submeshes_needed = submeshes_sorted[:count]
-    print(f"  Found {len(submeshes)} components after cut. Keeping {count} largest.")
+    submeshes_needed = _regroup_with_fragments(
+        submeshes_sorted, count, min_fragment_faces
+    )
 
     # Step 3: Fill holes only in needed components
     repaired_components = []
