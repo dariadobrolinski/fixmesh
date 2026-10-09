@@ -24,7 +24,12 @@ def cut_repair(mesh, max_patch_edge_multiplier=1.6, fairing="smoothing",
             input mesh's median edge length. It controls patch edge length in
             legacy mode and local movement size in geometry-preserving mode.
         fairing (str): ``"smoothing"`` blends local vertex movement into the
-            surrounding surface. ``"none"`` moves only intersecting faces.
+            surrounding surface (flattest surface that closes the hole,
+            which loses sulcal depth). ``"poisson"`` instead targets the
+            real curvature borrowed from the rim vertices bordering the
+            hole, so the patch keeps bending like the cortex around it
+            instead of going flat. ``"none"`` moves only intersecting
+            faces.
         refine_patches (bool): Legacy-only option that makes completed patches
             finer and smooths them together.
         base_widening (int): Extra neighboring rings affected by repair.
@@ -59,7 +64,7 @@ def cut_repair(mesh, max_patch_edge_multiplier=1.6, fairing="smoothing",
         raise ValueError("max_passes must be at least 1")
     if strategy not in ("geometry_preserving", "legacy"):
         raise ValueError(f"unknown repair strategy {strategy!r}")
-    if fairing not in ("smoothing", "none"):
+    if fairing not in ("smoothing", "poisson", "none"):
         raise ValueError(f"unknown fairing mode {fairing!r}")
     if bool(output_directory) != bool(output_filename):
         raise ValueError(
@@ -857,9 +862,34 @@ def _umbrella_laplacian(faces, num_vertices):
     return adjacency - sparse.identity(num_vertices, format="csr")
 
 
+def _rim_curvature(vertices, faces, free):
+    # Mean-curvature vector at every non-patch (pinned) vertex, computed using
+    # only its own non-patch neighbors -- i.e. the real, uncut cortex shape,
+    # unaffected by the hole or the flat patch filling it. Vertices with no
+    # such neighbor (deep interior, far from any patch) get zero.
+    pinned = ~free
+    edges = np.vstack((faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]))
+    edges = np.unique(np.vstack((edges, edges[:, ::-1])), axis=0)
+    keep = pinned[edges[:, 0]] & pinned[edges[:, 1]]
+    edges = edges[keep]
+    rows, cols = edges[:, 0], edges[:, 1]
+
+    degree = np.bincount(rows, minlength=len(vertices)).astype(float)
+    neighbor_sum = np.zeros_like(vertices)
+    np.add.at(neighbor_sum, rows, vertices[cols])
+
+    delta = np.zeros_like(vertices)
+    has_rim_neighbor = degree > 0
+    delta[has_rim_neighbor] = (
+        neighbor_sum[has_rim_neighbor] / degree[has_rim_neighbor, None]
+        - vertices[has_rim_neighbor]
+    )
+    return delta, has_rim_neighbor
+
+
 def _fair_patch_vertices(vertices, faces, patch_faces, mode="smoothing"):
     # Moves the position of free points to create smooth, curved surface.
-    if mode != "smoothing":
+    if mode not in ("smoothing", "poisson"):
         raise ValueError(f"unknown fairing mode {mode!r}")
 
     vertices = np.asarray(vertices, dtype=float)
@@ -873,9 +903,26 @@ def _fair_patch_vertices(vertices, faces, patch_faces, mode="smoothing"):
     pinned = np.where(free[:, None], 0.0, vertices)
 
     system = laplacian[free_ids][:, free_ids].tocsc()
+    factor = splu(system)
     rhs = -(laplacian[free_ids] @ pinned)
 
-    factor = splu(system)
+    if mode == "poisson":
+        # Instead of solving L*x = 0 (the flattest possible surface, which is
+        # what starves sulcal depth), borrow the real curvature from the rim
+        # vertices bordering the hole and harmonically interpolate it across
+        # the patch, then solve L*x = delta for that target curvature. Same
+        # factorized system as the position solve -- just a different rhs.
+        rim_delta, has_rim_neighbor = _rim_curvature(vertices, faces, free)
+        if np.any(has_rim_neighbor):
+            pinned_delta = np.where(
+                (free | ~has_rim_neighbor)[:, None], 0.0, rim_delta
+            )
+            delta_rhs = -(laplacian[free_ids] @ pinned_delta)
+            delta_free = np.column_stack(
+                [factor.solve(delta_rhs[:, axis]) for axis in range(3)]
+            )
+            rhs = rhs + delta_free
+
     faired = vertices.copy()
     faired[free_ids] = np.column_stack(
         [factor.solve(rhs[:, axis]) for axis in range(3)]
