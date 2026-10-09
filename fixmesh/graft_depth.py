@@ -1,5 +1,6 @@
 """Cut-and-patch, but reattach severed gyri with a depth-preserving zipper
-stitch instead of a flat PyMeshFix cap.
+stitch instead of a flat PyMeshFix cap, and pull patch geometry back toward
+the original fold depth instead of smoothing it flat.
 
 Same cut as before: delete every self-intersecting face, split into pieces,
 classify big-enough leftovers as real anatomy (gyri) rather than noise, and
@@ -14,6 +15,16 @@ fallback for fragments the zipper can't confidently match (multi-hole
 pieces, no nearby hole, wildly mismatched loop sizes), and every stitch is
 checked against its local neighborhood for new self-intersections before
 being accepted.
+
+This variant (forked from graft.py, which stays untouched as a known-good
+fallback) also replaces plain Laplacian fairing with a depth-aware version:
+most patches still come from PyMeshFix's flat cap, not the zipper, and pure
+smoothing has no idea a sulcus used to be there -- it just blends the patch
+into the flattest possible surface, erasing the fold. `_depth_pull_patch_vertices`
+instead pulls each disconnected patch region partway back toward the
+original, pre-cut surface (which still traces the fold's true depth even
+where it got removed for self-intersecting), capped to a small distance and
+checked locally so it can't recreate the tangle it's targeting.
 """
 import sys
 import time
@@ -37,19 +48,23 @@ from scipy.spatial import cKDTree
 # same pattern rather than running them as a one-shot pass at the end.
 try:
     from fixmesh.cut import (
+        _classify_repair_faces,
         _compute_median_edge_length,
-        _refair_accumulated_patch,
+        _fair_patch_vertices,
+        _free_patch_vertices,
         _refine_accumulated_patch,
     )
 except ImportError:
     from cut import (
+        _classify_repair_faces,
         _compute_median_edge_length,
-        _refair_accumulated_patch,
+        _fair_patch_vertices,
+        _free_patch_vertices,
         _refine_accumulated_patch,
     )
 
 INPUT = '/Users/daria/fixmesh/examples/both_factor_0.stl'
-OUT = '/Users/daria/fixmesh/examples/graft-stitched.stl'
+OUT = '/Users/daria/fixmesh/examples/graft-depth.stl'
 MIN_FRAGMENT_FACES = 60
 MAX_PASSES = 30
 
@@ -344,6 +359,165 @@ def one_pass(current, keep_count, min_faces):
     return pymesh.form_mesh(np.asarray(out.vertices), np.asarray(out.faces))
 
 
+def _local_edge_scale(faces, vertices, vertex_ids):
+    """Average length of the edges touching each of `vertex_ids`, used to
+    scale how far that vertex is allowed to move."""
+    edges = np.vstack([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]])
+    lengths = np.linalg.norm(vertices[edges[:, 0]] - vertices[edges[:, 1]], axis=1)
+    sums = np.zeros(len(vertices))
+    counts = np.zeros(len(vertices))
+    np.add.at(sums, edges[:, 0], lengths)
+    np.add.at(counts, edges[:, 0], 1)
+    np.add.at(sums, edges[:, 1], lengths)
+    np.add.at(counts, edges[:, 1], 1)
+    counts = np.maximum(counts, 1)
+    return (sums / counts)[vertex_ids]
+
+
+def _patch_components(vertices, faces, patch_faces):
+    """Group patch faces into their disconnected regions (sharing an edge),
+    so each hole/seam can be pulled and safety-checked independently
+    instead of treating every patch on the mesh as one blob.
+    """
+    patch_ids = np.flatnonzero(patch_faces)
+    if len(patch_ids) == 0:
+        return []
+    sub = trimesh.Trimesh(vertices=vertices, faces=faces[patch_ids], process=False)
+    groups = trimesh.graph.connected_components(
+        sub.face_adjacency, nodes=np.arange(len(patch_ids)), min_len=1
+    )
+    return [patch_ids[g] for g in groups]
+
+
+def _nearby_faces_for_region(face_centre_tree, faces, vertices, region_face_ids,
+                             pad_multiplier=3.0):
+    """Faces within a small, capped-pull-sized radius of `region_face_ids`,
+    found via a spatial index instead of scanning every face in the mesh --
+    with tens of thousands of patch faces spread across hundreds of
+    separate regions, a linear scan per region is the difference between
+    this finishing in seconds and taking the better part of an hour.
+    """
+    touched = np.unique(faces[region_face_ids])
+    centre = vertices[touched].mean(axis=0)
+    spread = np.linalg.norm(vertices[touched] - centre, axis=1).max()
+    edge_scale = max(_local_edge_scale(faces, vertices, touched).mean(), 1e-6)
+    radius = spread + pad_multiplier * edge_scale
+    return np.asarray(face_centre_tree.query_ball_point(centre, radius), dtype=np.int64)
+
+
+def _local_region_is_safe(vertices, faces, region_face_ids, nearby_face_ids):
+    """Check one patch region against a precomputed set of nearby faces for
+    self-intersections, scoped to just the area a small, capped pull could
+    plausibly reach, rather than paying for a whole-mesh check.
+    """
+    relevant = np.union1d(region_face_ids, nearby_face_ids)
+    used, remapped = np.unique(faces[relevant], return_inverse=True)
+    local = pymesh.form_mesh(vertices[used], remapped.reshape(-1, 3))
+    return len(pymesh.detect_self_intersection(local)) == 0
+
+
+def _depth_pull_patch_vertices(vertices, faces, patch_faces, reference_vertices,
+                               pull_strength=0.5, max_pull_multiplier=2.0):
+    """Like cut.py's _fair_patch_vertices, but each free patch vertex is
+    also pulled partway toward the nearest point on the ORIGINAL, pre-cut
+    surface instead of settling purely into the flattest blend with its
+    neighbors. Pure Laplacian smoothing has no idea a sulcus used to be
+    there, so it erases it; the original surface still traces the fold's
+    true depth even in the region that got cut away for self-intersecting.
+
+    Each disconnected patch region is pulled and validated independently:
+    the pull is capped (max_pull_multiplier * local edge length) and the
+    region is checked against its local neighborhood for new self-
+    intersections; a mesh this size can have thousands of separate patch
+    regions (one per PyMeshFix repair), and each safety check has real
+    fixed overhead regardless of region size, so this tries the pull once
+    per region -- not a shrinking ladder of retries -- and falls straight
+    back to plain smoothing (the original, already-safe behavior) for that
+    region if that single attempt isn't safe.
+    """
+    vertices = np.asarray(vertices, dtype=float)
+    faces = np.asarray(faces, dtype=np.int64)
+    result = _fair_patch_vertices(vertices, faces, patch_faces, mode="smoothing")
+
+    free = _free_patch_vertices(faces, patch_faces, len(vertices))
+    if not np.any(free):
+        return result
+
+    tree = cKDTree(reference_vertices)
+    components = _patch_components(result, faces, patch_faces)
+    # Built once from the pre-pull positions: which faces are "nearby" a
+    # given region doesn't meaningfully change from the small nudges this
+    # function makes, so there's no need to rebuild this per region or per
+    # retry -- only the live vertex positions passed into the actual
+    # intersection check need to be current.
+    face_centre_tree = cKDTree(result[faces].mean(axis=1))
+    print(f"  {len(components):,} disconnected patch region(s) to pull.",
+          flush=True)
+
+    pulled, fallback = 0, 0
+    for count, region_face_ids in enumerate(components, start=1):
+        if count % 200 == 0:
+            print(f"    ...{count}/{len(components)} regions processed "
+                  f"({pulled} pulled, {fallback} fallback so far)",
+                  flush=True)
+        region_vertex_ids = np.unique(faces[region_face_ids])
+        free_in_region = region_vertex_ids[free[region_vertex_ids]]
+        if len(free_in_region) == 0:
+            continue
+
+        _, nearest = tree.query(result[free_in_region])
+        targets = reference_vertices[nearest]
+        pull_vec = targets - result[free_in_region]
+        max_pull = max_pull_multiplier * _local_edge_scale(faces, result, free_in_region)
+        pull_dist = np.linalg.norm(pull_vec, axis=1)
+        clamp = np.minimum(1.0, max_pull / np.maximum(pull_dist, 1e-9))
+        clamped_pull = clamp[:, None] * pull_vec
+
+        nearby_face_ids = _nearby_faces_for_region(
+            face_centre_tree, faces, result, region_face_ids
+        )
+        candidate = result.copy()
+        candidate[free_in_region] = result[free_in_region] + pull_strength * clamped_pull
+        if _local_region_is_safe(candidate, faces, region_face_ids, nearby_face_ids):
+            result = candidate
+            pulled += 1
+        else:
+            fallback += 1
+
+    print(f"  Depth pull: {pulled} patch region(s) pulled toward original "
+          f"depth, {fallback} left as plain smoothing (would "
+          "self-intersect).", flush=True)
+    return result
+
+
+def _depth_aware_refair_accumulated_patch(current, original_mesh,
+                                          pull_strength=0.5,
+                                          max_pull_multiplier=2.0):
+    """Like cut.py's _refair_accumulated_patch, but pulls each patch region
+    partway back toward the original, pre-repair surface instead of pure
+    Laplacian smoothing, so a fold's depth isn't just erased into the
+    flattest possible blend. Falls back to plain smoothing, region by
+    region, wherever the pull would reintroduce a self-intersection.
+    """
+    vertices = np.asarray(current.vertices, dtype=float)
+    faces = np.asarray(current.faces, dtype=np.int64)
+    patch_faces = _classify_repair_faces(
+        vertices, faces, original_mesh.vertices, original_mesh.faces
+    )
+    if not np.any(patch_faces):
+        return current
+    print(f"  {int(np.count_nonzero(patch_faces)):,} accumulated patch faces "
+          "will be pulled toward original depth where safe.", flush=True)
+    faired = _depth_pull_patch_vertices(
+        vertices, faces, patch_faces,
+        np.asarray(original_mesh.vertices, dtype=float),
+        pull_strength=pull_strength,
+        max_pull_multiplier=max_pull_multiplier,
+    )
+    result, _ = pymesh.remove_duplicated_vertices(pymesh.form_mesh(faired, faces))
+    return result
+
+
 def main():
     mesh = pymesh.load_mesh(INPUT)
     mesh, _ = pymesh.remove_duplicated_vertices(mesh)
@@ -380,8 +554,9 @@ def main():
                       "after repeated patch cleanup; stopping.", flush=True)
                 break
             if not refaired:
-                print("  Fairing accumulated patch geometry.", flush=True)
-                current = _refair_accumulated_patch(current, mesh, "smoothing")
+                print("  Fairing accumulated patch geometry (depth-aware).",
+                      flush=True)
+                current = _depth_aware_refair_accumulated_patch(current, mesh)
                 refaired = True
                 previous_remaining = None
                 continue
