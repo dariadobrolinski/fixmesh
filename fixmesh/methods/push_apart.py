@@ -13,7 +13,7 @@ looks merged in a viewer. A second phase keeps nudging facing walls apart
 until there is at least `clearance` between them.
 
 Whatever can't be separated within the movement limit is handed to
-cut_repair (legacy, no smoothing), so it only has to cut a small remainder.
+cut_repair (no smoothing), so it only has to cut a small remainder.
 """
 import sys
 import time
@@ -163,7 +163,7 @@ def push_apart_repair(mesh, step=0.2, rings=3, smoothing_iterations=3,
         clearance (float): Smallest gap left between facing walls once they
             no longer cross, in median edge lengths, so touching gyri don't
             look merged. 0 skips this phase.
-        cut_leftovers (bool): Run cut_repair (legacy, no smoothing) on any
+        cut_leftovers (bool): Run cut_repair (no smoothing) on any
             crossings left after pushing.
         output_path (str): If given, the result is also saved there.
 
@@ -214,7 +214,7 @@ def push_apart_repair(mesh, step=0.2, rings=3, smoothing_iterations=3,
 
     if best and cut_leftovers:
         print("Cutting the remaining crossings with cut_repair.", flush=True)
-        result = cut_repair(current, strategy="legacy", fairing="none")
+        result = cut_repair(current, fairing="none")
     else:
         result = trimesh.Trimesh(np.asarray(current.vertices),
                                  np.asarray(current.faces), process=False)

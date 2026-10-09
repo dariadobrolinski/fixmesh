@@ -12,25 +12,14 @@ git clone https://github.com/yourusername/fixmesh.git
 cd fixmesh
 ```
 
-## Geometry-preserving cut repair
-
-`cut_repair` now preserves source faces by splitting triangles at intersection
-curves and moving only the local colliding regions. It does not delete small
-fragments or place flat caps over the cuts.
+## Repair methods
 
 ```python
-result = fixmesh.cut_repair(mesh, strategy="geometry_preserving")
+result = fixmesh.cut_repair(mesh)          # cut the crossing faces and patch the holes
+result = fixmesh.push_apart_repair(mesh)   # push crossing walls apart instead of cutting
 ```
 
-The previous cut-and-cap behavior remains available for comparisons:
-
-```python
-result = fixmesh.cut_repair(mesh, strategy="legacy")
-```
-
-The geometry-preserving strategy raises an error instead of returning a mesh
-that still has intersections, has open boundaries, or changes the number of
-components.
+See `docs/methods_comparison.md` for how the methods compare.
 
 ## Documentation
 See https://kenichi-maeda.github.io/fixmesh/.

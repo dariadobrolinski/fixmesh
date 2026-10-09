@@ -2,7 +2,6 @@ import os
 import trimesh
 import numpy as np
 import pymesh
-from collections import defaultdict
 import pymeshfix
 from scipy import sparse
 from scipy.sparse.linalg import splu
@@ -11,7 +10,7 @@ from scipy.spatial import cKDTree
 def cut_repair(mesh, max_patch_edge_multiplier=1.6, fairing="smoothing",
                refine_patches=False, base_widening=0, max_passes=20,
                max_widening=3, output_directory=None, output_filename=None,
-               strategy="geometry_preserving", min_fragment_faces=60):
+               min_fragment_faces=60):
     """
     Repair a mesh by removing intersecting faces and filling the holes.
 
@@ -20,21 +19,15 @@ def cut_repair(mesh, max_patch_edge_multiplier=1.6, fairing="smoothing",
 
     Args:
         mesh (pymesh.Mesh): Mesh to repair.
-        max_patch_edge_multiplier (float): Repair scale measured against the
-            input mesh's median edge length. It controls patch edge length in
-            legacy mode and local movement size in geometry-preserving mode.
-        fairing (str): ``"smoothing"`` blends local vertex movement into the
-            surrounding surface (flattest surface that closes the hole,
-            which loses sulcal depth). ``"poisson"`` instead targets the
-            real curvature borrowed from the rim vertices bordering the
-            hole, so the patch keeps bending like the cortex around it
-            instead of going flat. ``"none"`` moves only intersecting
-            faces.
-        refine_patches (bool): Legacy-only option that makes completed patches
-            finer and smooths them together.
-        base_widening (int): Extra neighboring rings affected by repair.
-            Geometry-preserving mode blends movement across these rings;
-            legacy mode removes them.
+        max_patch_edge_multiplier (float): Patch edge length, measured
+            against the input mesh's median edge length.
+        fairing (str): ``"smoothing"`` smooths each patch into the
+            surrounding surface (the flattest surface that closes the hole).
+            ``"none"`` leaves PyMeshFix's patch as it is.
+        refine_patches (bool): Makes completed patches finer and smooths
+            them together.
+        base_widening (int): Extra rings of neighboring faces removed
+            around every cut.
         max_passes (int): Maximum number of repair passes.
         max_widening (int): Maximum number of stronger local retries when
             repair stalls.
@@ -43,15 +36,11 @@ def cut_repair(mesh, max_patch_edge_multiplier=1.6, fairing="smoothing",
             disk before it's returned. Leave both as None to skip saving.
         output_filename (str): File name for the saved result, e.g.
             "repaired.stl". Set this together with output_directory.
-        min_fragment_faces (int): Legacy-only. Smallest offcut, measured in
+        min_fragment_faces (int): Smallest offcut, measured in
             faces, that counts as anatomy rather than debris. Cutting the
             intersecting faces severs gyri from the surface; anything this
             size or larger is reattached to the body it came from instead of
             being discarded. Set to 0 for the old keep-the-largest-components
-            behavior.
-        strategy (str): ``"geometry_preserving"`` keeps every original
-            component and uses the original curvature to shape new patches.
-            ``"legacy"`` uses the previous largest-component cut-and-cap
             behavior.
 
     Returns:
@@ -62,9 +51,7 @@ def cut_repair(mesh, max_patch_edge_multiplier=1.6, fairing="smoothing",
         raise ValueError("max_patch_edge_multiplier must be positive")
     if max_passes < 1:
         raise ValueError("max_passes must be at least 1")
-    if strategy not in ("geometry_preserving", "legacy"):
-        raise ValueError(f"unknown repair strategy {strategy!r}")
-    if fairing not in ("smoothing", "poisson", "none"):
+    if fairing not in ("smoothing", "none"):
         raise ValueError(f"unknown fairing mode {fairing!r}")
     if bool(output_directory) != bool(output_filename):
         raise ValueError(
@@ -76,27 +63,16 @@ def cut_repair(mesh, max_patch_edge_multiplier=1.6, fairing="smoothing",
         _compute_median_edge_length(mesh) * max_patch_edge_multiplier
     )
 
-    if strategy == "legacy":
-        final_mesh = _run_legacy_cut_repair(
-            mesh,
-            target_edge_length,
-            fairing,
-            refine_patches,
-            base_widening,
-            max_passes,
-            max_widening,
-            min_fragment_faces,
-        )
-    else:
-        final_mesh = _run_geometry_preserving_repair(
-            mesh,
-            target_edge_length,
-            fairing,
-            refine_patches,
-            base_widening,
-            max_passes,
-            max_widening,
-        )
+    final_mesh = _run_cut_repair(
+        mesh,
+        target_edge_length,
+        fairing,
+        refine_patches,
+        base_widening,
+        max_passes,
+        max_widening,
+        min_fragment_faces,
+    )
 
     if output_directory and output_filename:
         os.makedirs(output_directory, exist_ok=True)
@@ -107,10 +83,10 @@ def cut_repair(mesh, max_patch_edge_multiplier=1.6, fairing="smoothing",
     return final_mesh
 
 
-def _run_legacy_cut_repair(mesh, target_edge_length, fairing,
-                           refine_patches, base_widening, max_passes,
-                           max_widening, min_fragment_faces=0):
-    """Previous cut-and-cap implementation, kept for comparisons."""
+def _run_cut_repair(mesh, target_edge_length, fairing,
+                    refine_patches, base_widening, max_passes,
+                    max_widening, min_fragment_faces=0):
+    """Cut the intersecting faces and patch the holes, until none are left."""
     count = _count_num_components(mesh)
     current = mesh
     previous_intersections = None
@@ -170,393 +146,6 @@ def _run_legacy_cut_repair(mesh, target_edge_length, fairing,
     final_mesh.update_faces(final_mesh.nondegenerate_faces())
     final_mesh.remove_unreferenced_vertices()
     return final_mesh
-
-
-def _run_geometry_preserving_repair(mesh, target_edge_length, fairing,
-                                    refine_patches, base_widening,
-                                    max_passes, max_widening):
-    """Split intersection curves, then separate components without cutting."""
-    expected_components = _count_num_components(mesh)
-    current = _resolve_and_separate_components(mesh)
-    resolved_vertices = np.asarray(current.vertices, dtype=float).copy()
-    stalled_passes = 0
-    if refine_patches:
-        print(
-            "  refine_patches is unnecessary for geometry_preserving repair; "
-            "no holes are patched."
-        )
-
-    for pass_index in range(1, max_passes + 1):
-        intersections = pymesh.detect_self_intersection(current)
-        remaining = len(intersections)
-        print(f"Pass {pass_index}: {remaining} self-intersecting face pairs.")
-        if remaining == 0:
-            break
-
-        best = None
-        best_remaining = remaining
-        for step_scale in (1.0, 0.25, 0.0625):
-            candidate = _separate_intersecting_components(
-                current,
-                intersections,
-                target_edge_length,
-                smooth=(fairing != "none"),
-                smoothing_rings=5 + base_widening + stalled_passes,
-                strength=(1.0 + 0.5 * stalled_passes) * step_scale,
-                reference_vertices=resolved_vertices,
-                max_total_displacement=4.0 * target_edge_length,
-                verbose=False,
-            )
-            if _count_internal_intersections(candidate):
-                continue
-            candidate_remaining = len(
-                pymesh.detect_self_intersection(candidate)
-            )
-            if candidate_remaining < best_remaining:
-                best = candidate
-                best_remaining = candidate_remaining
-
-        used_rigid_fallback = False
-        if best is None:
-            for rigid_scale in (1.0, 2.0, 4.0, 8.0, 16.0, 32.0):
-                candidate = _rigid_separation_step(
-                    current,
-                    intersections,
-                    target_edge_length,
-                    strength=rigid_scale,
-                )
-                candidate_remaining = len(
-                    pymesh.detect_self_intersection(candidate)
-                )
-                if candidate_remaining < best_remaining:
-                    best = candidate
-                    best_remaining = candidate_remaining
-                    used_rigid_fallback = True
-                if candidate_remaining == 0:
-                    break
-
-        if best is None:
-            stalled_passes += 1
-            if stalled_passes > max_widening:
-                raise RuntimeError(
-                    "Could not reduce intersections without changing local "
-                    "surface geometry"
-                )
-            print(
-                "  No safe step improved the result; increasing separation "
-                f"strength to level {stalled_passes}."
-            )
-            continue
-
-        moved = np.linalg.norm(
-            np.asarray(best.vertices) - np.asarray(current.vertices), axis=1
-        )
-        total_moved = np.linalg.norm(
-            np.asarray(best.vertices) - resolved_vertices, axis=1
-        )
-        method = "rigid component" if used_rigid_fallback else "local"
-        print(
-            f"  Accepted {method} step: {remaining} -> {best_remaining} "
-            f"pairs; moved {int(np.count_nonzero(moved > 1e-12))} vertices "
-            f"(step max {moved.max():.3f}, total max "
-            f"{total_moved.max():.3f}); no faces were removed."
-        )
-        current = best
-        stalled_passes = 0
-    else:
-        remaining = len(pymesh.detect_self_intersection(current))
-        if remaining:
-            raise RuntimeError(
-                f"Reached max_passes={max_passes} with {remaining} "
-                "self-intersecting face pairs"
-            )
-
-    final_remaining = len(pymesh.detect_self_intersection(current))
-    if final_remaining:
-        raise RuntimeError(
-            f"Repair finished with {final_remaining} self-intersecting face pairs"
-        )
-
-    final_mesh = _pymesh_to_trimesh(current)
-    final_mesh.update_faces(final_mesh.nondegenerate_faces())
-    final_mesh.remove_unreferenced_vertices()
-    actual_components = current.num_surface_components
-    if actual_components != expected_components:
-        raise RuntimeError(
-            "Repair changed the number of components from "
-            f"{expected_components} to {actual_components}"
-        )
-    if not final_mesh.is_watertight:
-        raise RuntimeError("Geometry-preserving repair produced an open mesh")
-    return final_mesh
-
-
-def _mesh_face_components(mesh):
-    """Return connected face ids without changing their original order."""
-    tm = trimesh.Trimesh(
-        vertices=np.asarray(mesh.vertices),
-        faces=np.asarray(mesh.faces),
-        process=False,
-    )
-    return trimesh.graph.connected_components(
-        tm.face_adjacency,
-        nodes=np.arange(mesh.num_faces),
-        min_len=1,
-    )
-
-
-def _submesh_from_faces(mesh, face_ids):
-    faces = np.asarray(mesh.faces)[np.asarray(face_ids, dtype=np.int64)]
-    used, remapped = np.unique(faces, return_inverse=True)
-    return pymesh.form_mesh(
-        np.asarray(mesh.vertices)[used], remapped.reshape(-1, 3)
-    )
-
-
-def _resolve_and_separate_components(mesh):
-    """Resolve each source component independently, preserving its topology."""
-    original_components = _mesh_face_components(mesh)
-    components = []
-    total_internal = 0
-    for component_index, face_ids in enumerate(original_components):
-        component = _submesh_from_faces(mesh, face_ids)
-        internal = len(pymesh.detect_self_intersection(component))
-        total_internal += internal
-        if internal:
-            print(
-                f"  Component {component_index}: splitting {internal} "
-                "internal intersection pairs without deleting faces."
-            )
-            component = pymesh.resolve_self_intersection(
-                component, engine="igl"
-            )
-            component, _ = pymesh.remove_duplicated_vertices(component)
-            component, _ = pymesh.remove_duplicated_faces(component)
-            component, _ = pymesh.remove_isolated_vertices(component)
-        if not component.is_closed():
-            raise RuntimeError(
-                f"Resolved component {component_index} is not closed"
-            )
-        remaining = len(pymesh.detect_self_intersection(component))
-        if remaining:
-            raise RuntimeError(
-                f"Resolved component {component_index} still has "
-                f"{remaining} internal intersections"
-            )
-        components.append(component)
-
-    result = pymesh.merge_meshes(components)
-    component_labels = np.concatenate([
-        np.full(component.num_faces, component_index, dtype=float)
-        for component_index, component in enumerate(components)
-    ])
-    result.add_attribute("source_component")
-    result.set_attribute("source_component", component_labels)
-    print(
-        f"  Preserved all {mesh.num_faces} source faces as "
-        f"{result.num_faces} triangles after resolving {total_internal} "
-        "within-component pairs."
-    )
-    return result
-
-
-def _face_component_labels(mesh):
-    if "source_component" in mesh.attribute_names:
-        labels = mesh.get_attribute("source_component").astype(np.int64)
-        components = [
-            np.flatnonzero(labels == component_index)
-            for component_index in np.unique(labels)
-        ]
-        return components, labels
-
-    components = _mesh_face_components(mesh)
-    labels = np.empty(mesh.num_faces, dtype=np.int64)
-    for component_index, face_ids in enumerate(components):
-        labels[np.asarray(face_ids, dtype=np.int64)] = component_index
-    return components, labels
-
-
-def _copy_component_labels(source, target):
-    if "source_component" in source.attribute_names:
-        target.add_attribute("source_component")
-        target.set_attribute(
-            "source_component",
-            source.get_attribute("source_component"),
-        )
-    return target
-
-
-def _count_internal_intersections(mesh):
-    total = 0
-    components, _ = _face_component_labels(mesh)
-    for face_ids in components:
-        component = _submesh_from_faces(mesh, face_ids)
-        total += len(pymesh.detect_self_intersection(component))
-    return total
-
-
-def _rigid_separation_step(mesh, intersections, target_edge_length,
-                           strength=1.0):
-    """Translate whole components when local movement would fold a surface."""
-    vertices = np.asarray(mesh.vertices, dtype=float).copy()
-    faces = np.asarray(mesh.faces, dtype=np.int64)
-    components, face_labels = _face_component_labels(mesh)
-    centroids = []
-    component_vertices = []
-    for face_ids in components:
-        vertex_ids = np.unique(faces[np.asarray(face_ids, dtype=np.int64)])
-        component_vertices.append(vertex_ids)
-        centroids.append(vertices[vertex_ids].mean(axis=0))
-    centroids = np.asarray(centroids)
-
-    directions = np.zeros_like(centroids)
-    weights = np.zeros(len(centroids), dtype=float)
-    for first_face, second_face in np.asarray(intersections, dtype=np.int64):
-        first = face_labels[first_face]
-        second = face_labels[second_face]
-        if first == second:
-            continue
-        axis = centroids[first] - centroids[second]
-        length = np.linalg.norm(axis)
-        if length <= 1e-12:
-            continue
-        axis /= length
-        directions[first] += axis
-        directions[second] -= axis
-        weights[first] += 1.0
-        weights[second] += 1.0
-
-    active = weights > 0
-    if not np.any(active):
-        return mesh
-    directions[active] /= weights[active, None]
-    lengths = np.linalg.norm(directions, axis=1)
-    step = 0.25 * target_edge_length * strength
-    directions[active] *= (
-        step / np.maximum(lengths[active], 1e-12)
-    )[:, None]
-    for component_index, vertex_ids in enumerate(component_vertices):
-        vertices[vertex_ids] += directions[component_index]
-    return _copy_component_labels(
-        mesh, pymesh.form_mesh(vertices, faces)
-    )
-
-
-def _vertex_average_matrix(faces, num_vertices):
-    edges = np.vstack((faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]))
-    edges = np.unique(np.vstack((edges, edges[:, ::-1])), axis=0)
-    rows, cols = edges[:, 0], edges[:, 1]
-    degree = np.bincount(rows, minlength=num_vertices).astype(float)
-    return sparse.coo_matrix(
-        (1.0 / np.maximum(degree[rows], 1.0), (rows, cols)),
-        shape=(num_vertices, num_vertices),
-    ).tocsr()
-
-
-def _separate_intersecting_components(mesh, intersections, target_edge_length,
-                                      smooth=True, smoothing_rings=3,
-                                      strength=1.0, reference_vertices=None,
-                                      max_total_displacement=np.inf,
-                                      verbose=True):
-    """Move intersecting sheets apart while keeping their connectivity."""
-    vertices = np.asarray(mesh.vertices, dtype=float).copy()
-    faces = np.asarray(mesh.faces, dtype=np.int64)
-    components, face_labels = _face_component_labels(mesh)
-    centroids = []
-    for face_ids in components:
-        vertex_ids = np.unique(faces[np.asarray(face_ids, dtype=np.int64)])
-        centroids.append(vertices[vertex_ids].mean(axis=0))
-    centroids = np.asarray(centroids)
-    face_centers = vertices[faces].mean(axis=1)
-    face_normals = np.cross(
-        vertices[faces[:, 1]] - vertices[faces[:, 0]],
-        vertices[faces[:, 2]] - vertices[faces[:, 0]],
-    )
-    normal_lengths = np.linalg.norm(face_normals, axis=1)
-    face_normals /= np.maximum(normal_lengths[:, None], 1e-12)
-
-    displacement = np.zeros_like(vertices)
-    contributions = np.zeros(len(vertices), dtype=float)
-    cross_component_contributions = np.zeros(len(vertices), dtype=float)
-    same_component_contributions = np.zeros(len(vertices), dtype=float)
-    same_component_pairs = 0
-    for first_face, second_face in np.asarray(intersections, dtype=np.int64):
-        first_component = face_labels[first_face]
-        second_component = face_labels[second_face]
-        if first_component == second_component:
-            same_component_pairs += 1
-            axis = face_centers[first_face] - face_centers[second_face]
-        else:
-            axis = centroids[first_component] - centroids[second_component]
-        axis_length = np.linalg.norm(axis)
-        if axis_length <= 1e-12:
-            axis = face_normals[first_face] - face_normals[second_face]
-            axis_length = np.linalg.norm(axis)
-        if axis_length <= 1e-12:
-            continue
-        axis /= axis_length
-
-        first_vertices = faces[first_face]
-        second_vertices = faces[second_face]
-        displacement[first_vertices] += axis
-        displacement[second_vertices] -= axis
-        contributions[first_vertices] += 1.0
-        contributions[second_vertices] += 1.0
-        if first_component == second_component:
-            same_component_contributions[first_vertices] += 1.0
-            same_component_contributions[second_vertices] += 1.0
-        else:
-            cross_component_contributions[first_vertices] += 1.0
-            cross_component_contributions[second_vertices] += 1.0
-
-    seeds = contributions > 0
-    if not np.any(seeds):
-        raise RuntimeError("Could not find vertices to separate")
-    displacement[seeds] /= contributions[seeds, None]
-    lengths = np.linalg.norm(displacement, axis=1)
-    step = 0.25 * target_edge_length * strength
-    displacement[seeds] *= (
-        step / np.maximum(lengths[seeds], 1e-12)
-    )[:, None]
-    only_same_component = (
-        (same_component_contributions > 0) &
-        (cross_component_contributions == 0)
-    )
-    displacement[only_same_component] *= 0.25
-
-    if smooth:
-        adjacency = _vertex_average_matrix(faces, len(vertices))
-        for _ in range(max(0, smoothing_rings)):
-            displacement = 0.7 * displacement + 0.3 * (adjacency @ displacement)
-
-    if reference_vertices is not None and np.isfinite(max_total_displacement):
-        reference_vertices = np.asarray(reference_vertices, dtype=float)
-        proposed_total = vertices + displacement - reference_vertices
-        proposed_length = np.linalg.norm(proposed_total, axis=1)
-        limited = proposed_length > max_total_displacement
-        proposed_total[limited] *= (
-            max_total_displacement / proposed_length[limited]
-        )[:, None]
-        displacement = reference_vertices + proposed_total - vertices
-
-    moved = np.linalg.norm(displacement, axis=1)
-    vertices += displacement
-    total_moved = (
-        np.linalg.norm(vertices - reference_vertices, axis=1)
-        if reference_vertices is not None
-        else moved
-    )
-    if verbose:
-        print(
-            f"  Moved {int(np.count_nonzero(moved > 1e-12))} local vertices "
-            f"(median {np.median(moved[moved > 1e-12]):.3f}, "
-            f"step max {moved.max():.3f}, total max {total_moved.max():.3f}); "
-            f"handled {same_component_pairs} within-component pairs; "
-            "no faces were removed."
-        )
-    return _copy_component_labels(
-        mesh, pymesh.form_mesh(vertices, faces)
-    )
 
 
 def _classify_repair_faces(vertices, faces, original_vertices, original_faces, tol=1e-4):
@@ -862,34 +451,9 @@ def _umbrella_laplacian(faces, num_vertices):
     return adjacency - sparse.identity(num_vertices, format="csr")
 
 
-def _rim_curvature(vertices, faces, free):
-    # Mean-curvature vector at every non-patch (pinned) vertex, computed using
-    # only its own non-patch neighbors -- i.e. the real, uncut cortex shape,
-    # unaffected by the hole or the flat patch filling it. Vertices with no
-    # such neighbor (deep interior, far from any patch) get zero.
-    pinned = ~free
-    edges = np.vstack((faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]))
-    edges = np.unique(np.vstack((edges, edges[:, ::-1])), axis=0)
-    keep = pinned[edges[:, 0]] & pinned[edges[:, 1]]
-    edges = edges[keep]
-    rows, cols = edges[:, 0], edges[:, 1]
-
-    degree = np.bincount(rows, minlength=len(vertices)).astype(float)
-    neighbor_sum = np.zeros_like(vertices)
-    np.add.at(neighbor_sum, rows, vertices[cols])
-
-    delta = np.zeros_like(vertices)
-    has_rim_neighbor = degree > 0
-    delta[has_rim_neighbor] = (
-        neighbor_sum[has_rim_neighbor] / degree[has_rim_neighbor, None]
-        - vertices[has_rim_neighbor]
-    )
-    return delta, has_rim_neighbor
-
-
 def _fair_patch_vertices(vertices, faces, patch_faces, mode="smoothing"):
     # Moves the position of free points to create smooth, curved surface.
-    if mode not in ("smoothing", "poisson"):
+    if mode != "smoothing":
         raise ValueError(f"unknown fairing mode {mode!r}")
 
     vertices = np.asarray(vertices, dtype=float)
@@ -905,23 +469,6 @@ def _fair_patch_vertices(vertices, faces, patch_faces, mode="smoothing"):
     system = laplacian[free_ids][:, free_ids].tocsc()
     factor = splu(system)
     rhs = -(laplacian[free_ids] @ pinned)
-
-    if mode == "poisson":
-        # Instead of solving L*x = 0 (the flattest possible surface, which is
-        # what starves sulcal depth), borrow the real curvature from the rim
-        # vertices bordering the hole and harmonically interpolate it across
-        # the patch, then solve L*x = delta for that target curvature. Same
-        # factorized system as the position solve -- just a different rhs.
-        rim_delta, has_rim_neighbor = _rim_curvature(vertices, faces, free)
-        if np.any(has_rim_neighbor):
-            pinned_delta = np.where(
-                (free | ~has_rim_neighbor)[:, None], 0.0, rim_delta
-            )
-            delta_rhs = -(laplacian[free_ids] @ pinned_delta)
-            delta_free = np.column_stack(
-                [factor.solve(delta_rhs[:, axis]) for axis in range(3)]
-            )
-            rhs = rhs + delta_free
 
     faired = vertices.copy()
     faired[free_ids] = np.column_stack(
@@ -964,89 +511,7 @@ def _compute_median_edge_length(mesh):
 
     return np.median(edge_lengths) if edge_lengths else 0
 
-def _collapse_long_edges(mesh):
-    tol = _compute_median_edge_length(mesh) * 1.6
-    new_mesh, _ = pymesh.split_long_edges(mesh, tol)
-    return new_mesh
-
 def _count_num_components(mesh):
     mesh = _pymesh_to_trimesh(mesh)
     components = mesh.split(only_watertight=True)
     return len(components)
-
-
-def _cut_repair_legacy(mesh):
-    """
-    Fix self-intersections by cutting the given mesh.
-
-    Args:
-        mesh (pymesh.Mesh): The input mesh with self-intersections.
-
-    Returns:
-        trimesh.Trimesh: The repaired mesh with no self-intersections.
-    """
-    # 1) Remove all self‑intersecting faces
-    count = _count_num_components(mesh)
-    intersecting = pymesh.detect_self_intersection(mesh).flatten()
-    intersected = set(intersecting.tolist())
-
-    all_faces   = np.arange(mesh.num_faces)
-    keep_faces  = np.setdiff1d(all_faces, list(intersected))
-    kept_verts  = mesh.faces[keep_faces]
-    uniq_v, remap = np.unique(kept_verts, return_inverse=True)
-    new_mesh   = pymesh.form_mesh(mesh.vertices[uniq_v],
-                                  remap.reshape(-1,3))
-
-    # 2) Split into  submeshes
-    submeshes = _pymesh_to_trimesh(new_mesh).split(only_watertight=False)
-    submeshes_sorted = sorted(submeshes,
-                              key=lambda m: len(m.vertices),
-                              reverse=True)
-    submeshes_needed = submeshes_sorted[:count]
-
-    # 3) Process each component
-    repaired_submesh_needed = []
-    for sub in submeshes_needed:
-        # — a) remove one‑ring neighbor faces
-        faces = sub.faces
-        edge_to_faces = defaultdict(list)
-        for fi, f in enumerate(faces):
-            for u, v in ((f[0], f[1]), (f[1], f[2]), (f[2], f[0])):
-                e = tuple(sorted((u, v)))
-                edge_to_faces[e].append(fi)
-
-        # find all boundary faces (edges used by exactly one face)
-        boundary_faces = {fs[0]
-                          for e, fs in edge_to_faces.items()
-                          if len(fs) == 1}
-
-        # collect neighbors of those boundary faces
-        neighbors = set()
-        for bf in boundary_faces:
-            f = faces[bf]
-            for u, v in ((f[0], f[1]), (f[1], f[2]), (f[2], f[0])):
-                e = tuple(sorted((u, v)))
-                neighbors.update(edge_to_faces[e])
-
-        # removal set: all neighbor faces (includes the boundary faces themselves)
-        to_remove = neighbors
-
-        # build filtered face list
-        keep_idx = [i for i in range(len(faces)) if i not in to_remove]
-        filtered_faces = faces[keep_idx]
-
-        # re‑index and form a small pymesh.Mesh for this component
-        uv, remap_f = np.unique(filtered_faces, return_inverse=True)
-        pm = pymesh.form_mesh(sub.vertices[uv],
-                              remap_f.reshape(-1, 3))
-
-        # — b) convex hull + c) collapse long edges
-        pm = pymesh.convex_hull(pm)
-        pm = _collapse_long_edges(pm)
-
-        # back to Trimesh and collect
-        repaired_submesh_needed.append(_pymesh_to_trimesh(pm))
-
-    # 4) Reassemble all components
-    final = trimesh.util.concatenate(repaired_submesh_needed)
-    return final
