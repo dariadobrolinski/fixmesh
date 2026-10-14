@@ -27,6 +27,8 @@ from scipy import sparse
 from .cut import _compute_median_edge_length, cut_repair
 
 
+# Builds a table of which points are joined by an edge, so we know each
+# point's neighbors.
 def _vertex_adjacency(faces, num_vertices):
     edges = np.vstack([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]])
     edges = np.vstack([edges, edges[:, ::-1]])
@@ -37,6 +39,8 @@ def _vertex_adjacency(faces, num_vertices):
     return adjacency
 
 
+# Works out which way is "out" of the brain for each piece of the mesh, so
+# pushes always go back into the gyrus even if a piece was saved inside-out.
 def _outward_sign(vertices, faces):
     """+1 or -1 per vertex, so that sign * normal points out of the brain
     even if a component's faces are wound inside-out."""
@@ -52,6 +56,8 @@ def _outward_sign(vertices, faces):
     return sign
 
 
+# Finds the direction pointing straight out of the surface at each point.
+# We push against this direction, back into the gyrus.
 def _vertex_normals(vertices, faces):
     face_normals = np.cross(vertices[faces[:, 1]] - vertices[faces[:, 0]],
                             vertices[faces[:, 2]] - vertices[faces[:, 0]])
@@ -62,6 +68,9 @@ def _vertex_normals(vertices, faces):
     return normals / np.maximum(length, 1e-12)
 
 
+# Shares a push with the surrounding rows of points, so the crossing spot
+# moves the most and the movement fades out around it. Keeps the wall
+# bending smoothly instead of getting dents.
 def _spread(displacement, moving, adjacency, degree, rings, iterations):
     """Share the movement of `moving` vertices with `rings` rings of
     neighbors, so the surface bends smoothly instead of denting."""
@@ -74,6 +83,10 @@ def _spread(displacement, moving, adjacency, degree, rings, iterations):
     return displacement
 
 
+# Picks out crossings that appeared somewhere new, i.e. a wall ran into a
+# different wall. Old crossings, and ones that just slid over by one
+# triangle as the wall moved, don't count. Used for the "new" count in the
+# log and for the optional safety net (undo_new_crossings).
 def _new_crossings(pairs, faces, ever_crossing, adjacency):
     """Crossing pairs where at least one of the two faces isn't on or next to
     a vertex that has ever been on a crossing face. A crossing that only
@@ -87,6 +100,8 @@ def _new_crossings(pairs, faces, ever_crossing, adjacency):
     return pairs[~(near_face[pairs[:, 0]] & near_face[pairs[:, 1]])]
 
 
+# Puts the points around some crossings (plus a small margin) back to where
+# they were before the last push. Used by the safety net and the gap step.
 def _undo_around(pairs, faces, adjacency, rings, candidate, safe):
     """Put the vertices of `pairs`, plus a margin of rings, back to `safe`.
     Returns the mask of vertices that were put back."""
@@ -98,6 +113,9 @@ def _undo_around(pairs, faces, adjacency, rings, candidate, safe):
     return undo
 
 
+# Counts triangles that are folded over their neighbors (facing the opposite
+# way from the triangles around them) and triangles squashed thin (smallest
+# angle under 10 degrees). Only used to report on mesh quality.
 def _triangle_check(vertices, faces, face_adjacency, min_angle=10.0):
     """Count triangles folded over their neighbors (facing the opposite way
     from the triangles around them) and triangles squashed below
@@ -121,6 +139,8 @@ def _triangle_check(vertices, faces, face_adjacency, min_angle=10.0):
     return int(folded.sum()), int(squashed.sum())
 
 
+# Prints the folded and squashed triangle counts before and after, for the
+# log.
 def _report_triangles(label, before, after, faces):
     face_adjacency = trimesh.Trimesh(before, faces, process=False).face_adjacency
     folded_before, squashed_before = _triangle_check(before, faces, face_adjacency)
@@ -130,6 +150,8 @@ def _report_triangles(label, before, after, faces):
           f"degrees (was {squashed_before:,})", flush=True)
 
 
+# Pulls back any point that has moved further than the limit (3 mm), so it
+# sits exactly at the limit.
 def _cap(displacement, limit):
     length = np.linalg.norm(displacement, axis=1)
     too_far = length > limit
@@ -137,6 +159,8 @@ def _cap(displacement, limit):
     return displacement
 
 
+# Measures the distance from each point straight across the fold to the
+# opposite wall. Only used by the gap step.
 def _gap_to_facing_wall(vertices, faces, outward_normals, edge):
     """Distance from each vertex, straight out along its normal, to the
     first wall it hits (inf if none)."""
@@ -148,6 +172,8 @@ def _gap_to_facing_wall(vertices, faces, outward_normals, edge):
     return scene.cast_rays(o3d.core.Tensor(rays))["t_hit"].numpy()
 
 
+# The gap step (off by default): nudges walls that are touching until there
+# is a small space between them, without ever making them cross.
 def _open_gaps(vertices, faces, clearance, step, rings, smoothing_iterations,
                limit, max_iters, patience):
     """Push facing walls apart until they are at least `clearance` apart,
@@ -195,6 +221,9 @@ def _open_gaps(vertices, faces, clearance, step, rings, smoothing_iterations,
     return original + best_displacement
 
 
+# The main function: sets things up, pushes crossing walls apart round by
+# round until nothing crosses (or it gets stuck), cuts whatever is left,
+# and returns the repaired mesh.
 def push_apart_repair(mesh, step=0.2, rings=3, smoothing_iterations=3,
                       max_displacement=3.0, max_iters=300, patience=15,
                       clearance=0, cut_leftovers=True, units="mm",
