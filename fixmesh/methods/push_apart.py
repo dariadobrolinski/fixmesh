@@ -15,7 +15,10 @@ nudging facing walls apart until there is at least `clearance` between them.
 Whatever can't be separated within the movement limit is handed to
 cut_repair (no smoothing), so it only has to cut a small remainder.
 """
-import sys
+import argparse
+import contextlib
+import io
+import os
 import time
 
 import numpy as np
@@ -175,7 +178,7 @@ def _gap_to_facing_wall(vertices, faces, outward_normals, edge):
 # The gap step (off by default): nudges walls that are touching until there
 # is a small space between them, without ever making them cross.
 def _open_gaps(vertices, faces, clearance, step, rings, smoothing_iterations,
-               limit, max_iters, patience):
+               limit, max_iters, patience, verbose=False):
     """Push facing walls apart until they are at least `clearance` apart,
     without ever creating a crossing. Each wall closes half the shortfall."""
     original = vertices
@@ -193,8 +196,9 @@ def _open_gaps(vertices, faces, clearance, step, rings, smoothing_iterations,
             best, best_displacement, stale = int(tight.sum()), displacement.copy(), 0
         else:
             stale += 1
-        print(f"Gap {iteration}: {int(tight.sum()):,} vertices closer than "
-              f"{clearance:.3f} to the facing wall", flush=True)
+        if verbose:
+            print(f"Gap {iteration}: {int(tight.sum()):,} vertices closer than "
+                  f"{clearance:.3f} to the facing wall", flush=True)
         if not tight.any() or stale >= patience:
             break
 
@@ -217,7 +221,9 @@ def _open_gaps(vertices, faces, clearance, step, rings, smoothing_iterations,
                   flush=True)
             break
         displacement = candidate
-    _report_triangles("Gap check", original, original + best_displacement, faces)
+    if verbose:
+        _report_triangles("Gap check", original, original + best_displacement,
+                          faces)
     return original + best_displacement
 
 
@@ -227,7 +233,8 @@ def _open_gaps(vertices, faces, clearance, step, rings, smoothing_iterations,
 def push_apart_repair(mesh, step=0.2, rings=3, smoothing_iterations=3,
                       max_displacement=3.0, max_iters=300, patience=15,
                       clearance=0, cut_leftovers=True, units="mm",
-                      undo_new_crossings=False, output_path=None):
+                      undo_new_crossings=False, verbose=False,
+                      output_path=None):
     """Push crossing walls apart until the mesh no longer self-intersects.
 
     Args:
@@ -261,6 +268,8 @@ def push_apart_repair(mesh, step=0.2, rings=3, smoothing_iterations=3,
             crossings are rare and the next round pushes them apart anyway,
             while freezing leaves ~40% more crossings to cut. Meant for
             cases like two surfaces pushed into each other.
+        verbose (bool): Also print a line for every push round, gap round
+            and cut_repair pass, instead of just the summaries.
         output_path (str): If given, the result is also saved there.
 
     Returns:
@@ -277,8 +286,11 @@ def push_apart_repair(mesh, step=0.2, rings=3, smoothing_iterations=3,
     degree = np.maximum(np.asarray(adjacency.sum(axis=1)).ravel(), 1)
     sign = _outward_sign(original, faces)
     limit = max_displacement * scale
-    print(f"Median edge {edge:.3f}; step {step * scale:.3f}, limit {limit:.3f}, "
-          f"clearance {clearance * scale:.3f} (mesh units)", flush=True)
+    print("Starting push...", flush=True)
+    if verbose:
+        print(f"Median edge {edge:.3f}; step {step * scale:.3f}, limit "
+              f"{limit:.3f}, clearance {clearance * scale:.3f} (mesh units)",
+              flush=True)
     start = time.time()
 
     displacement = np.zeros_like(original)
@@ -318,10 +330,13 @@ def push_apart_repair(mesh, step=0.2, rings=3, smoothing_iterations=3,
             best, best_displacement, stale = remaining, displacement.copy(), 0
         else:
             stale += 1
-        moved = np.linalg.norm(displacement, axis=1)
-        print(f"Push {iteration}: {remaining:,} crossings ({len(fresh):,} new), "
-              f"{int(np.count_nonzero(moved > 1e-9)):,} vertices moved "
-              f"(max {moved.max():.3f})", flush=True)
+        if iteration == 1:
+            initial = remaining
+        if verbose:
+            moved = np.linalg.norm(displacement, axis=1)
+            print(f"Push {iteration}: {remaining:,} crossings ({len(fresh):,} "
+                  f"new), {int(np.count_nonzero(moved > 1e-9)):,} vertices "
+                  f"moved (max {moved.max():.3f})", flush=True)
         if remaining == 0 or stale >= patience:
             break
 
@@ -337,27 +352,39 @@ def push_apart_repair(mesh, step=0.2, rings=3, smoothing_iterations=3,
         displacement[frozen] = safe_displacement[frozen]
 
     current = pymesh.form_mesh(original + best_displacement, faces)
-    moved = np.linalg.norm(best_displacement, axis=1)
-    print(f"Pushing done in {time.time() - start:.1f}s: {best:,} crossings left, "
-          f"{int(np.count_nonzero(moved > 1e-9)):,} vertices moved, "
-          f"mean move {moved[moved > 1e-9].mean() if moved.any() else 0:.3f}, "
-          f"max {moved.max():.3f}; {new_total:,} new crossings appeared, "
-          f"{int(frozen.sum()):,} vertices frozen; no faces removed.", flush=True)
-    _report_triangles("Push check", original, original + best_displacement, faces)
+    if verbose:
+        moved = np.linalg.norm(best_displacement, axis=1)
+        print(f"Pushing done in {time.time() - start:.1f}s ({iteration} "
+              f"rounds): {initial:,} crossings -> {best:,} left, "
+              f"{int(np.count_nonzero(moved > 1e-9)):,} vertices moved, mean "
+              f"move {moved[moved > 1e-9].mean() if moved.any() else 0:.3f}, "
+              f"max {moved.max():.3f}; {new_total:,} new crossings appeared, "
+              f"{int(frozen.sum()):,} vertices frozen; no faces removed.",
+              flush=True)
+        _report_triangles("Push check", original, original + best_displacement,
+                          faces)
 
     if best and cut_leftovers:
-        print("Cutting the remaining crossings with cut_repair.", flush=True)
-        result = cut_repair(current, fairing="none")
+        print("Cutting remaining intersections...", flush=True)
+        if verbose:
+            result = cut_repair(current, fairing="none")
+        else:
+            with contextlib.redirect_stdout(io.StringIO()) as cut_log:
+                result = cut_repair(current, fairing="none")
+            if "Reached max_passes" in cut_log.getvalue():
+                print("  Warning: cut_repair ran out of passes with "
+                      "crossings remaining.", flush=True)
     else:
         result = trimesh.Trimesh(np.asarray(current.vertices),
                                  np.asarray(current.faces), process=False)
 
     if clearance > 0:
+        print("Opening gaps...", flush=True)
         vertices = _open_gaps(
             np.asarray(result.vertices, dtype=float),
             np.asarray(result.faces, dtype=np.int64),
             clearance * scale, step * scale, rings, smoothing_iterations,
-            limit, max_iters, patience)
+            limit, max_iters, patience, verbose)
         result = trimesh.Trimesh(vertices, np.asarray(result.faces),
                                  process=False)
     if output_path:
@@ -365,6 +392,72 @@ def push_apart_repair(mesh, step=0.2, rings=3, smoothing_iterations=3,
     return result
 
 
+def _output_path(input_path, output):
+    """Where to save: next to the input as push_apart_<name> if no output is
+    given, inside `output` if it is a folder, otherwise `output` itself."""
+    default_name = "push_apart_" + os.path.basename(input_path)
+    if output is None:
+        return os.path.join(os.path.dirname(input_path), default_name)
+    if os.path.isdir(output) or output.endswith(os.sep):
+        os.makedirs(output, exist_ok=True)
+        return os.path.join(output, default_name)
+    folder = os.path.dirname(output)
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+    return output
+
+
+# The `push_apart` terminal command: reads a mesh, repairs it and saves it.
+# Run `push_apart -h` to see all options.
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog="push_apart",
+        description="Fix self-intersections by pushing crossing walls apart.")
+    parser.add_argument("input", help="Mesh to repair (.stl, .ply, .obj, ...).")
+    parser.add_argument(
+        "output", nargs="?",
+        help="Where to save: a file name, or a folder (saved there as "
+             "push_apart_<input name>). Default: next to the input, as "
+             "push_apart_<input name>.")
+    parser.add_argument("-s", "--step", type=float, default=0.2,
+                        help="How far crossing points move per round, in mm "
+                             "(default 0.2).")
+    parser.add_argument("-l", "--limit", type=float, default=3.0,
+                        help="Furthest any point may move in total, in mm "
+                             "(default 3).")
+    parser.add_argument("-g", "--gaps", type=float, nargs="?", const=0.25,
+                        default=0, metavar="MM",
+                        help="Turn on the gap step: leave at least MM between "
+                             "walls that touch (default 0.25 if no number).")
+    parser.add_argument("-u", "--undo-new", action="store_true",
+                        help="Turn on the safety net: undo pushes that make "
+                             "walls cross somewhere new.")
+    parser.add_argument("-e", "--edge-units", action="store_true",
+                        help="Measure --step, --limit and --gaps in triangle "
+                             "sides instead of mm (for meshes not in mm).")
+    parser.add_argument("--no-cut", action="store_true",
+                        help="Don't cut the crossings left after pushing.")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="Print a line for every round, not just the "
+                             "summaries.")
+    args = parser.parse_args(argv)
+
+    if not os.path.isfile(args.input):
+        parser.error(f"input file not found: {args.input}")
+    output_path = _output_path(args.input, args.output)
+    result = push_apart_repair(
+        pymesh.load_mesh(args.input), step=args.step,
+        max_displacement=args.limit, clearance=args.gaps,
+        cut_leftovers=not args.no_cut,
+        units="edge" if args.edge_units else "mm",
+        undo_new_crossings=args.undo_new, verbose=args.verbose,
+        output_path=output_path)
+    remaining = len(pymesh.detect_self_intersection(
+        pymesh.form_mesh(np.asarray(result.vertices), np.asarray(result.faces))))
+    print(f"Saved {output_path}")
+    print(f"Self-intersections left: {remaining:,}")
+    print("Finished!")
+
+
 if __name__ == '__main__':
-    # python -m fixmesh.methods.push_apart <input> <output>
-    push_apart_repair(pymesh.load_mesh(sys.argv[1]), output_path=sys.argv[2])
+    main()
