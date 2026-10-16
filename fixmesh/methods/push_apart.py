@@ -13,7 +13,8 @@ looks merged in a viewer. An optional second phase (off by default) keeps
 nudging facing walls apart until there is at least `clearance` between them.
 
 Whatever can't be separated within the movement limit is handed to
-cut_repair (no smoothing), so it only has to cut a small remainder.
+cut_repair, so it only has to cut a small remainder. Its patches are left
+as PyMeshFix makes them unless smooth_patches is on.
 """
 import argparse
 import contextlib
@@ -89,7 +90,7 @@ def _spread(displacement, moving, adjacency, degree, rings, iterations):
 # Picks out crossings that appeared somewhere new, i.e. a wall ran into a
 # different wall. Old crossings, and ones that just slid over by one
 # triangle as the wall moved, don't count. Used for the "new" count in the
-# log and for the optional safety net (undo_new_crossings).
+# log.
 def _new_crossings(pairs, faces, ever_crossing, adjacency):
     """Crossing pairs where at least one of the two faces isn't on or next to
     a vertex that has ever been on a crossing face. A crossing that only
@@ -104,7 +105,7 @@ def _new_crossings(pairs, faces, ever_crossing, adjacency):
 
 
 # Puts the points around some crossings (plus a small margin) back to where
-# they were before the last push. Used by the safety net and the gap step.
+# they were before the last push. Used by the gap step.
 def _undo_around(pairs, faces, adjacency, rings, candidate, safe):
     """Put the vertices of `pairs`, plus a margin of rings, back to `safe`.
     Returns the mask of vertices that were put back."""
@@ -232,9 +233,8 @@ def _open_gaps(vertices, faces, clearance, step, rings, smoothing_iterations,
 # and returns the repaired mesh.
 def push_apart_repair(mesh, step=0.2, rings=3, smoothing_iterations=3,
                       max_displacement=3.0, max_iters=300, patience=15,
-                      clearance=0, cut_leftovers=True, units="mm",
-                      undo_new_crossings=False, verbose=False,
-                      output_path=None):
+                      clearance=0, cut_leftovers=True, smooth_patches=False,
+                      units="mm", verbose=False, output_path=None):
     """Push crossing walls apart until the mesh no longer self-intersects.
 
     Args:
@@ -255,19 +255,17 @@ def push_apart_repair(mesh, step=0.2, rings=3, smoothing_iterations=3,
         clearance (float): Smallest gap left between facing walls once they
             no longer cross, in mm (or median edge lengths), so touching gyri don't
             look merged. 0 (the default) skips this phase.
-        cut_leftovers (bool): Run cut_repair (no smoothing) on any
-            crossings left after pushing.
+        cut_leftovers (bool): Run cut_repair on any crossings left after
+            pushing.
+        smooth_patches (bool): Make cut_repair's patches finer and smooth
+            them into the surrounding surface. Off (the default) leaves
+            PyMeshFix's flat, coarse patches, which look sharp. Until
+            cut_repair's patch detection is fixed, turning this on also
+            flattens large areas outside the patches after pushing.
         units (str): "mm" (the default) measures `step`,
             `max_displacement` and `clearance` in the mesh's own units, which
             is mm for brain surfaces; "edge" measures them in median edge
             lengths, for meshes in other units.
-        undo_new_crossings (bool): Where a push makes walls cross somewhere
-            they never crossed before (e.g. through a thin gyrus), undo it
-            there and stop moving those vertices; what still crosses is left
-            for cut_repair. Off by default: on a single surface those
-            crossings are rare and the next round pushes them apart anyway,
-            while freezing leaves ~40% more crossings to cut. Meant for
-            cases like two surfaces pushed into each other.
         verbose (bool): Also print a line for every push round, gap round
             and cut_repair pass, instead of just the summaries.
         output_path (str): If given, the result is also saved there.
@@ -296,36 +294,18 @@ def push_apart_repair(mesh, step=0.2, rings=3, smoothing_iterations=3,
     displacement = np.zeros_like(original)
     best, best_displacement, stale = None, displacement.copy(), 0
     ever_crossing = np.zeros(len(original), dtype=bool)
-    # Vertices whose push made walls cross somewhere new; they stop moving
-    # and whatever still crosses there is left for cut_repair.
-    frozen = np.zeros(len(original), dtype=bool)
-    safe_displacement, new_total = displacement.copy(), 0
+    new_total = 0
     for iteration in range(1, max_iters + 1):
         vertices = original + displacement
         pairs = pymesh.detect_self_intersection(pymesh.form_mesh(vertices, faces))
         fresh = (_new_crossings(pairs, faces, ever_crossing, adjacency)
                  if iteration > 1 else [])
+        # New crossings are simply pushed apart next round like any other.
         new_total += len(fresh)
-        # Optionally, where the last push made walls cross somewhere new,
-        # undo it just around those spots and keep it everywhere else.
-        # Otherwise new crossings are simply pushed apart next round.
-        for _ in range(5 if undo_new_crossings else 0):
-            if len(fresh) == 0:
-                break
-            before_undo = displacement.copy()
-            frozen |= _undo_around(fresh, faces, adjacency, rings,
-                                   displacement, safe_displacement)
-            if np.array_equal(displacement, before_undo):
-                break  # not caused by the last push; nothing to undo
-            vertices = original + displacement
-            pairs = pymesh.detect_self_intersection(
-                pymesh.form_mesh(vertices, faces))
-            fresh = _new_crossings(pairs, faces, ever_crossing, adjacency)
         remaining = len(pairs)
         crossing = np.zeros(len(original), dtype=bool)
         crossing[np.unique(faces[np.asarray(pairs).ravel()])] = True
         ever_crossing |= crossing
-        safe_displacement = displacement.copy()
         if best is None or remaining < best:
             best, best_displacement, stale = remaining, displacement.copy(), 0
         else:
@@ -349,7 +329,6 @@ def push_apart_repair(mesh, step=0.2, rings=3, smoothing_iterations=3,
         displacement = _spread(displacement, crossing, adjacency, degree,
                                rings, smoothing_iterations)
         displacement = _cap(displacement, limit)
-        displacement[frozen] = safe_displacement[frozen]
 
     current = pymesh.form_mesh(original + best_displacement, faces)
     if verbose:
@@ -358,19 +337,21 @@ def push_apart_repair(mesh, step=0.2, rings=3, smoothing_iterations=3,
               f"rounds): {initial:,} crossings -> {best:,} left, "
               f"{int(np.count_nonzero(moved > 1e-9)):,} vertices moved, mean "
               f"move {moved[moved > 1e-9].mean() if moved.any() else 0:.3f}, "
-              f"max {moved.max():.3f}; {new_total:,} new crossings appeared, "
-              f"{int(frozen.sum()):,} vertices frozen; no faces removed.",
+              f"max {moved.max():.3f}; {new_total:,} new crossings appeared; "
+              f"no faces removed.",
               flush=True)
         _report_triangles("Push check", original, original + best_displacement,
                           faces)
 
     if best and cut_leftovers:
         print("Cutting remaining intersections...", flush=True)
+        cut_options = (dict(fairing="smoothing", refine_patches=True)
+                       if smooth_patches else dict(fairing="none"))
         if verbose:
-            result = cut_repair(current, fairing="none")
+            result = cut_repair(current, **cut_options)
         else:
             with contextlib.redirect_stdout(io.StringIO()) as cut_log:
-                result = cut_repair(current, fairing="none")
+                result = cut_repair(current, **cut_options)
             if "Reached max_passes" in cut_log.getvalue():
                 print("  Warning: cut_repair ran out of passes with "
                       "crossings remaining.", flush=True)
@@ -429,14 +410,14 @@ def main(argv=None):
                         default=0, metavar="MM",
                         help="Turn on the gap step: leave at least MM between "
                              "walls that touch (default 0.25 if no number).")
-    parser.add_argument("-u", "--undo-new", action="store_true",
-                        help="Turn on the safety net: undo pushes that make "
-                             "walls cross somewhere new.")
     parser.add_argument("-e", "--edge-units", action="store_true",
                         help="Measure --step, --limit and --gaps in triangle "
                              "sides instead of mm (for meshes not in mm).")
     parser.add_argument("--no-cut", action="store_true",
                         help="Don't cut the crossings left after pushing.")
+    parser.add_argument("--smooth", action="store_true",
+                        help="Make the cut patches finer and smooth them "
+                             "into the surrounding surface.")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Print a line for every round, not just the "
                              "summaries.")
@@ -448,9 +429,9 @@ def main(argv=None):
     result = push_apart_repair(
         pymesh.load_mesh(args.input), step=args.step,
         max_displacement=args.limit, clearance=args.gaps,
-        cut_leftovers=not args.no_cut,
+        cut_leftovers=not args.no_cut, smooth_patches=args.smooth,
         units="edge" if args.edge_units else "mm",
-        undo_new_crossings=args.undo_new, verbose=args.verbose,
+        verbose=args.verbose,
         output_path=output_path)
     remaining = len(pymesh.detect_self_intersection(
         pymesh.form_mesh(np.asarray(result.vertices), np.asarray(result.faces))))
