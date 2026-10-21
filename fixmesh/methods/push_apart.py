@@ -15,6 +15,12 @@ nudging facing walls apart until there is at least `clearance` between them.
 Whatever can't be separated within the movement limit is handed to
 cut_repair, so it only has to cut a small remainder. Its patches are left
 as PyMeshFix makes them unless smooth_patches is on.
+
+The last step fixes squashed triangles (three corners almost in a line).
+PyMesh doesn't mind them, but TetGen takes them for crossings and stops.
+Each one is flipped: it and its healthy neighbor share an edge, and drawing
+the other diagonal of that four-sided shape gives two normal triangles. No
+point moves. A flip that makes a face cross another is put back.
 """
 import argparse
 import contextlib
@@ -154,6 +160,129 @@ def _report_triangles(label, before, after, faces):
           f"degrees (was {squashed_before:,})", flush=True)
 
 
+# Smallest corner of each triangle, in degrees.
+def _min_angles(vertices, faces):
+    corners = vertices[faces]
+    angles = []
+    for k in range(3):
+        a = corners[:, (k + 1) % 3] - corners[:, k]
+        b = corners[:, (k + 2) % 3] - corners[:, k]
+        cos = np.einsum("ij,ij->i", a, b) / np.maximum(
+            np.linalg.norm(a, axis=1) * np.linalg.norm(b, axis=1), 1e-15)
+        angles.append(np.degrees(np.arccos(np.clip(cos, -1, 1))))
+    return np.min(angles, axis=0)
+
+
+def _tri_min_angle(vertices, tri):
+    return _min_angles(vertices, np.array([tri]))[0]
+
+
+def _tri_normal(vertices, tri):
+    p = vertices[list(tri)]
+    return np.cross(p[1] - p[0], p[2] - p[0])
+
+
+# Which triangles touch each point, so we can find the neighbor across an
+# edge.
+def _vertex_faces(faces):
+    table = {}
+    for fi, f in enumerate(faces.tolist()):
+        for v in f:
+            table.setdefault(v, set()).add(fi)
+    return table
+
+
+# Flips the edges of squashed triangles. A triangle and its neighbor make a
+# four-sided shape; the edge between them is one of its two diagonals, and
+# flipping draws the other one. The same four points are used, so nothing
+# moves. Only done when both new triangles come out rounder and neither
+# folds over. Every flip is logged so it can be undone.
+def _flip_pass(vertices, faces, table, candidates, below, log, min_gain=1.0):
+    flips = 0
+    for fi in candidates:
+        if _tri_min_angle(vertices, faces[fi]) >= below:
+            continue
+        f = faces[fi].tolist()
+        lengths = [np.linalg.norm(vertices[f[(k + 1) % 3]] - vertices[f[k]])
+                   for k in range(3)]
+        for k in np.argsort(lengths)[::-1]:
+            u, v, a = f[k], f[(k + 1) % 3], f[(k + 2) % 3]
+            shared = (table[u] & table[v]) - {fi}
+            if len(shared) != 1:
+                continue
+            fj = next(iter(shared))
+            d = next(x for x in faces[fj] if x != u and x != v)
+            if d == a or table[a] & table[d]:
+                continue
+            new_i, new_j = (u, d, a), (d, v, a)
+            old_i = _tri_normal(vertices, (u, v, a))
+            old_j = _tri_normal(vertices, (v, u, d))
+            n_i, n_j = _tri_normal(vertices, new_i), _tri_normal(vertices, new_j)
+            if min(np.dot(n_i, old_i), np.dot(n_i, old_j),
+                   np.dot(n_j, old_i), np.dot(n_j, old_j)) <= 0:
+                continue
+            before = min(_tri_min_angle(vertices, (u, v, a)),
+                         _tri_min_angle(vertices, (v, u, d)))
+            after = min(_tri_min_angle(vertices, new_i),
+                        _tri_min_angle(vertices, new_j))
+            if after < before + min_gain:
+                continue
+            for g in (fi, fj):
+                for x in faces[g]:
+                    table[x].discard(g)
+            log.append((fi, fj, faces[fi].copy(), faces[fj].copy()))
+            faces[fi], faces[fj] = new_i, new_j
+            for g in (fi, fj):
+                for x in faces[g]:
+                    table[x].add(g)
+            flips += 1
+            break
+    return flips
+
+
+# A flip can occasionally turn a triangle so it crosses a neighbor. Looks
+# for crossings and puts back the flips whose new triangles are involved,
+# newest first.
+def _undo_crossing_flips(vertices, faces, table, log, max_rounds=5):
+    undone = 0
+    for _ in range(max_rounds):
+        pairs = pymesh.detect_self_intersection(
+            pymesh.form_mesh(vertices, faces))
+        if len(pairs) == 0:
+            break
+        bad = set(np.unique(pairs).tolist())
+        reverted = False
+        for k in range(len(log) - 1, -1, -1):
+            fi, fj, old_i, old_j = log[k]
+            if fi in bad or fj in bad:
+                for g in (fi, fj):
+                    for x in faces[g]:
+                        table[x].discard(g)
+                faces[fi], faces[fj] = old_i, old_j
+                for g in (fi, fj):
+                    for x in faces[g]:
+                        table[x].add(g)
+                del log[k]
+                undone += 1
+                reverted = True
+        if not reverted:
+            break
+    return undone
+
+
+# Flips the squashed triangles (a corner under `min_angle` degrees) of
+# `faces` in place, then undoes any flip that made faces cross.
+def _flip_squashed(vertices, faces, min_angle, rounds=5):
+    table = _vertex_faces(faces)
+    log = []
+    for _ in range(rounds):
+        candidates = np.where(_min_angles(vertices, faces) < min_angle)[0]
+        if _flip_pass(vertices, faces, table, candidates, min_angle, log) == 0:
+            break
+    undone = _undo_crossing_flips(vertices, faces, table, log)
+    return len(log), undone
+
+
 # Pulls back any point that has moved further than the limit (3 mm), so it
 # sits exactly at the limit.
 def _cap(displacement, limit):
@@ -234,6 +363,7 @@ def _open_gaps(vertices, faces, clearance, step, rings, smoothing_iterations,
 def push_apart_repair(mesh, step=0.2, rings=3, smoothing_iterations=3,
                       max_displacement=3.0, max_iters=300, patience=15,
                       clearance=0, cut_leftovers=True, smooth_patches=False,
+                      flip_squashed=True, squashed_angle=2.0,
                       units="mm", verbose=False, output_path=None):
     """Push crossing walls apart until the mesh no longer self-intersects.
 
@@ -262,6 +392,11 @@ def push_apart_repair(mesh, step=0.2, rings=3, smoothing_iterations=3,
             PyMeshFix's flat, coarse patches, which look sharp. Until
             cut_repair's patch detection is fixed, turning this on also
             flattens large areas outside the patches after pushing.
+        flip_squashed (bool): Last step: flip the edges of squashed
+            triangles so TetGen accepts the surface. Nothing moves; a flip
+            that makes faces cross is undone.
+        squashed_angle (float): A triangle with a corner smaller than this
+            many degrees counts as squashed.
         units (str): "mm" (the default) measures `step`,
             `max_displacement` and `clearance` in the mesh's own units, which
             is mm for brain surfaces; "edge" measures them in median edge
@@ -368,6 +503,16 @@ def push_apart_repair(mesh, step=0.2, rings=3, smoothing_iterations=3,
             limit, max_iters, patience, verbose)
         result = trimesh.Trimesh(vertices, np.asarray(result.faces),
                                  process=False)
+    if flip_squashed:
+        vertices = np.asarray(result.vertices, dtype=float)
+        faces = np.asarray(result.faces, dtype=np.int64).copy()
+        squashed = int((_min_angles(vertices, faces) < squashed_angle).sum())
+        flipped, undone = _flip_squashed(vertices, faces, squashed_angle)
+        left = int((_min_angles(vertices, faces) < squashed_angle).sum())
+        print(f"Flipped {flipped:,} edges ({undone} put back because faces "
+              f"crossed): {squashed:,} -> {left:,} triangles with a corner "
+              f"under {squashed_angle:g} degrees.", flush=True)
+        result = trimesh.Trimesh(vertices, faces, process=False)
     if output_path:
         result.export(output_path)
     return result
@@ -418,6 +563,13 @@ def main(argv=None):
     parser.add_argument("--smooth", action="store_true",
                         help="Make the cut patches finer and smooth them "
                              "into the surrounding surface.")
+    parser.add_argument("--no-flip", action="store_true",
+                        help="Don't flip the edges of squashed triangles at "
+                             "the end.")
+    parser.add_argument("--squashed-angle", type=float, default=2.0,
+                        metavar="DEG",
+                        help="Triangles with a corner under DEG degrees get "
+                             "flipped (default 2).")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Print a line for every round, not just the "
                              "summaries.")
@@ -430,6 +582,7 @@ def main(argv=None):
         pymesh.load_mesh(args.input), step=args.step,
         max_displacement=args.limit, clearance=args.gaps,
         cut_leftovers=not args.no_cut, smooth_patches=args.smooth,
+        flip_squashed=not args.no_flip, squashed_angle=args.squashed_angle,
         units="edge" if args.edge_units else "mm",
         verbose=args.verbose,
         output_path=output_path)
