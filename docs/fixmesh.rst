@@ -2,17 +2,17 @@ fixmesh package
 ===============
 
 
-fixmesh.cut
+fixmesh.methods.cut
 -------------
-.. automodule:: fixmesh.cut
+.. automodule:: fixmesh.methods.cut
    :members:
    :show-inheritance:
    :undoc-members:
 
-fixmesh.detach
+fixmesh.methods.detach
 --------------
 
-.. automodule:: fixmesh.detach
+.. automodule:: fixmesh.methods.detach
    :members:
    :show-inheritance:
    :undoc-members:

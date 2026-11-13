@@ -1,0 +1,283 @@
+%%
+%% This is file `sample-sigconf-authordraft.tex',
+%% generated with the docstrip utility.
+%%
+%% The original source files were:
+%%
+%% samples.dtx  (with options: `all,proceedings,bibtex,authordraft')
+%% 
+%% IMPORTANT NOTICE:
+%% 
+%% For the copyright see the source file.
+%% 
+%% Any modified versions of this file must be renamed
+%% with new filenames distinct from sample-sigconf-authordraft.tex.
+%% 
+%% For distribution of the original source see the terms
+%% for copying and modification in the file samples.dtx.
+%% 
+%% This generated file may be distributed as long as the
+%% original source files, as listed above, are part of the
+%% same distribution. (The sources need not necessarily be
+%% in the same archive or directory.)
+%%
+%%
+%% Commands for TeXCount
+%TC:macro \cite [option:text,text]
+%TC:macro \citep [option:text,text]
+%TC:macro \citet [option:text,text]
+%TC:envir table 0 1
+%TC:envir table* 0 1
+%TC:envir tabular [ignore] word
+%TC:envir displaymath 0 word
+%TC:envir math 0 word
+%TC:envir comment 0 0
+%%
+%% The first command in your LaTeX source must be the \documentclass
+%% command.
+%%
+%% For submission and review of your manuscript please change the
+%% command to \documentclass[manuscript, screen, review]{acmart}.
+%%
+%% When submitting camera ready or to TAPS, please change the command
+%% to \documentclass[sigconf]{acmart} or whichever template is required
+%% for your publication.
+%%
+%%
+\documentclass[review,anonymous,acmtog]{acmart}
+\acmSubmissionID{tcom\_122}
+%%
+%% \BibTeX command to typeset BibTeX logo in the docs
+\AtBeginDocument{%
+  \providecommand\BibTeX{{%
+    Bib\TeX}}}
+
+\usepackage{amsmath}
+\usepackage{setspace}
+\usepackage{titlesec}
+\usepackage[percent]{overpic}
+\usepackage{lipsum}  
+
+\newcommand{\TODO}[2]{{\color{blue} {#1}}}
+\graphicspath{{figures/}{pictures/}{images/}{./}} % where to search for the images
+
+%% We encourage the use of mathptmx for consistent usage of times font
+%% throughout the proceedings. However, if you encounter conflicts
+%% with other math-related packages, you may want to disable it.
+\usepackage{mathptmx}                  % use matching math font
+\usepackage{adjustbox} 
+\usepackage{placeins}
+
+\usepackage{graphicx}  % For including images
+\usepackage{stfloats}  % Helps keep floats at the top
+\usepackage{caption}   % Allows fine-tuned caption spacing
+
+\usepackage{xcolor}
+
+\usepackage{float} 
+\usepackage{wrapfig}
+\usepackage{lipsum}
+
+%% Rights management information.  This information is sent to you
+%% when you complete the rights form.  These commands have SAMPLE
+%% values in them; it is your responsibility as an author to replace
+%% the commands and values with those provided to you when you
+%% complete the rights form.
+% \setcopyright{acmlicensed}
+% \copyrightyear{2018}
+% \acmYear{2018}
+% \acmDOI{XXXXXXX.XXXXXXX}
+%% These commands are for a PROCEEDINGS abstract or paper.
+% \acmConference[Conference acronym 'XX]{Make sure to enter the correct
+%   conference title from your rights confirmation email}{June 03--05,
+%   2018}{Woodstock, NY}
+%%
+%%  Uncomment \acmBooktitle if the title of the proceedings is different
+%%  from ``Proceedings of ...''!
+%%
+%%\acmBooktitle{Woodstock '18: ACM Symposium on Neural Gaze Detection,
+%%  June 03--05, 2018, Woodstock, NY}
+% \acmISBN{978-1-4503-XXXX-X/2018/06}
+
+
+%%
+%% Submission ID.
+%% Use this when submitting an article to a sponsored event. You'll
+%% receive a unique submission ID from the organizers
+%% of the event, and this ID should be used as the parameter to this command.
+%%\acmSubmissionID{123-A56-BU3}
+
+%%
+%% For managing citations, it is recommended to use bibliography
+%% files in BibTeX format.
+%%
+%% You can then either use BibTeX with the ACM-Reference-Format style,
+%% or BibLaTeX with the acmnumeric or acmauthoryear sytles, that include
+%% support for advanced citation of software artefact from the
+%% biblatex-software package, also separately available on CTAN.
+%%
+%% Look at the sample-*-biblatex.tex files for templates showcasing
+%% the biblatex styles.
+%%
+
+%%
+%% The majority of ACM publications use numbered citations and
+%% references.  The command \citestyle{authoryear} switches to the
+%% "author year" style.
+%%
+%% If you are preparing content for an event
+%% sponsored by ACM SIGGRAPH, you must use the "author year" style of
+%% citations and references.
+%% Uncommenting
+%% the next command will enable that style.
+\citestyle{acmauthoryear}
+
+
+%%
+%% end of the preamble, start of the body of the document source.
+\begin{document}
+
+%%
+%% The "title" command has an optional parameter,
+%% allowing the author to define a "short title" to be used in page headers.
+\title{New Methods for Mesh Intersection Repair}
+
+%%
+%% The "author" command and its associated commands are used to define
+%% the authors and their affiliations.
+%% Of note is the shared affiliation of the first two authors, and the
+%% "authornote" and "authornotemark" commands
+%% used to denote shared contribution to the research.
+
+\author{Kenichi Maeda}
+\affiliation{%
+  \institution{University of Massachusetts Boston}
+  \city{Boston}
+  \country{USA}}
+\email{kenichi.maeda001@umb.edu}
+
+\author{Daniel Haehn}
+\authornote{Joint senior author}
+\affiliation{%
+  \institution{University of Massachusetts Boston}
+  \city{Boston}
+  \country{USA}}
+\email{daniel.haehn@umb.edu}
+
+\author{Sumientra Rampersad}
+\authornote{Joint senior author}
+\affiliation{%
+  \institution{University of Massachusetts Boston}
+  \city{Boston}
+  \country{USA}}
+\email{sumientra.rampersad@umb.edu}
+
+%%
+%% By default, the full list of authors will be used in the page
+%% headers. Often, this list is too long, and will overlap
+%% other information printed in the page headers. This command allows
+%% the author to define a more concise list
+%% of authors' names for this purpose.
+\renewcommand{\shortauthors}{Trovato et al.}
+
+%%
+%% The abstract is a short summary of the work to be presented in the
+%% article.
+\begin{abstract}
+  Triangular surface meshes have many uses in science and engineering. A common problem in mesh geometry is having intersections of multiple facets within one mesh, or between two meshes. This issue has been addressed for decades, resulting in many repair algorithms and tools, whether open source or commercial. Although all these methods achieve the purpose of repairing intersections, their performance varies from one another due to differences in approach and implementation. In our studies, we evaluate how different tools and algorithms affect the repair outcomes both visually and quantitatively, using a comprehensive set of mesh quality metrics. Moreover, even high-quality repairs might not be optimal depending on the specific use case of the mesh. Our goal is to assess not only how well the mesh has been repaired, but also to what extent the repair has structurally changed the geometry. Finally, we introduce a new repair method that is efficient and does not affect the integrity of the mesh. Furthermore, we look at two situations in which intersections require a different approach from the ones currently available, and propose potential strategies for addressing them.
+\end{abstract}
+
+%%
+%% The code below is generated by the tool at http://dl.acm.org/ccs.cfm.
+%% Please copy and paste the code instead of the example below.
+%%
+% \begin{CCSXML}
+% <ccs2012>
+%  <concept>
+%   <concept_id>00000000.0000000.0000000</concept_id>
+%   <concept_desc>Do Not Use This Code, Generate the Correct Terms for Your Paper</concept_desc>
+%   <concept_significance>500</concept_significance>
+%  </concept>
+%  <concept>
+%   <concept_id>00000000.00000000.00000000</concept_id>
+%   <concept_desc>Do Not Use This Code, Generate the Correct Terms for Your Paper</concept_desc>
+%   <concept_significance>300</concept_significance>
+%  </concept>
+%  <concept>
+%   <concept_id>00000000.00000000.00000000</concept_id>
+%   <concept_desc>Do Not Use This Code, Generate the Correct Terms for Your Paper</concept_desc>
+%   <concept_significance>100</concept_significance>
+%  </concept>
+%  <concept>
+%   <concept_id>00000000.00000000.00000000</concept_id>
+%   <concept_desc>Do Not Use This Code, Generate the Correct Terms for Your Paper</concept_desc>
+%   <concept_significance>100</concept_significance>
+%  </concept>
+% </ccs2012>
+% \end{CCSXML}
+
+% \ccsdesc[500]{Computing methodologies~Generate the Correct Terms for Your Paper}
+% \ccsdesc[300]{Do Not Use This Code~Generate the Correct Terms for Your Paper}
+% \ccsdesc{Do Not Use This Code~Generate the Correct Terms for Your Paper}
+% \ccsdesc[100]{Do Not Use This Code~Generate the Correct Terms for Your Paper}
+
+\begin{CCSXML}
+<ccs2012>
+   <concept>
+    <concept_id>10003120.10003145.10011769</concept_id>
+       <concept_desc>Human-centered computing~Empirical studies in visualization</concept_desc>
+       <concept_significance>300</concept_significance>
+       </concept>
+   <concept>
+       <concept_id>10010147.10010371.10010396.10010397</concept_id>
+       <concept_desc>Computing methodologies~Mesh models</concept_desc>
+       <concept_significance>500</concept_significance>
+       </concept>
+ </ccs2012>
+\end{CCSXML}
+
+\ccsdesc[300]{Computing methodologies~Modeling methodologies}
+\ccsdesc[300]{Human-centered computing~Empirical studies in visualization}
+\ccsdesc[500]{Computing methodologies~Mesh models}
+
+%%
+%% Keywords. The author(s) should pick words that accurately describe
+%% the work being presented. Separate the keywords with commas.
+\keywords{finite element model, triangular surface mesh, self-intersection, intersection, mesh repair}
+%% A "teaser" image appears between the author and affiliation
+%% information and the body of the document, and typically spans the
+%% page.
+\begin{teaserfigure}
+  \includegraphics[width=\textwidth]{figures/teaser_3.png}
+  \caption{\textbf{Merging two neighboring meshes.} Visual (left) and quantitative (right) comparison of mesh quality for the original and repaired meshes in test case 1 using five different repair methods. Figures show the inside of each mesh with intersections marked in red. In the tables, all metrics from aspect ratio to intact vertices are the mean value across the entire output mesh. For each metric, the value of the best-performing mesh is shown in bold.}
+  \label{fig:teaser}
+\end{teaserfigure}
+
+
+% \received{20 February 2007}
+% \received[revised]{12 March 2009}
+% \received[accepted]{5 June 2009}
+
+%%
+%% This command processes the author and affiliation and title
+%% information and builds the first part of the formatted document.
+\maketitle
+
+\input {sections/01_introduction}
+\input{sections/02_experimental_setup}
+\input{sections/03_exp1}
+\input{sections/05_exp3}
+\input{sections/04_exp2}
+\input{sections/Conclusion}
+
+%%
+%% The next two lines define the bibliography style to be used, and
+%% the bibliography file.
+\bibliographystyle{ACM-Reference-Format}
+\bibliography{template}
+
+
+\end{document}
+\endinput
+%%
+%% End of file `sample-sigconf-authordraft.tex'.

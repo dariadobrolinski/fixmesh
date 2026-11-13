@@ -1,6 +1,7 @@
 from .pymeshfix import fix_with_pymeshfix
 from .pymesh import fix_with_pymesh
-# from .meshlib import fix_with_meshlib
+from .meshlib import fix_with_meshlib
+from .surfacenet import fix_with_surfaceNet
 from .local_remesh import fix_with_localRemesh
 
 __all__ = [

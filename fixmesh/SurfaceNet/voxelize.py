@@ -70,15 +70,15 @@ def compute_median_edge_length(mesh):
 
 if __name__ == "__main__":
     mesh_files = [
-        "../../examples/data/two_spheres.ply",
-        "../../examples/data/three_spheres.ply",
-        "../../examples/data/sphere_cube.ply"
+        "../../examples/archive/data/two_spheres.ply",
+        "../../examples/archive/data/three_spheres.ply",
+        "../../examples/archive/data/sphere_cube.ply"
     ]
 
     output_dirs = [
-        "../../examples/SNResult/case1",
-        "../../examples/SNResult/case2",
-        "../../examples/SNResult/case3"
+        "../../examples/archive/SNResult/case1",
+        "../../examples/archive/SNResult/case2",
+        "../../examples/archive/SNResult/case3"
     ]
 
     for mesh_file, output_dir in zip(mesh_files, output_dirs):

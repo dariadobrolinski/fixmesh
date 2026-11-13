@@ -1,7 +1,10 @@
 from . import self_intersections
-from .cut import cut_repair
-from .detach import detach_repair
+from .methods import (cut_repair, detach_repair, kenichi_cut_repair,
+                      push_apart_multi_repair, push_apart_repair)
 
 __all__ = ["self_intersections",
            "cut_repair",
-           "detach_repair"]
+           "detach_repair",
+           "kenichi_cut_repair",
+           "push_apart_repair",
+           "push_apart_multi_repair"]

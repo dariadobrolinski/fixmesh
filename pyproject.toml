@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fixmesh"
+version = "0.1.0"
+description = "Try different 3D mesh repair methods."
+requires-python = ">=3.10"
+# Dependencies are not listed on purpose: PyMesh has to be built from source
+# (see PyMesh_Installation_Guide.md) and the "pymesh" on PyPI is a different
+# package. Set up pymesh_env first, then: pip install -e . --no-deps
+
+[project.scripts]
+push_apart = "fixmesh.methods.push_apart:main"
+push_apart_multi = "fixmesh.methods.push_apart_multi:main"
+
+[tool.setuptools.packages.find]
+include = ["fixmesh*"]
