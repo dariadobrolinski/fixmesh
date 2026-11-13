@@ -130,5 +130,67 @@ class RepairTests(unittest.TestCase):
                 ["push_apart_a.ply", "push_apart_b.ply"])
 
 
+class StepDownTests(unittest.TestCase):
+    # Too little room, so the count stalls and the step-down kicks in.
+    MESHES = staticmethod(lambda: [_sphere(1.0), _sphere(1.0, (1.0, 0, 0))])
+
+    def run_with(self, **settings):
+        return PM.push_apart_multi_repair(
+            self.MESHES(), step=0.05, max_displacement=0.2, patience=3,
+            **settings)
+
+    def test_stepping_down_never_ends_with_more_crossings(self):
+        # Both runs follow the same path until the first stall, and the
+        # stepping-down one then keeps the best state and only improves.
+        # (The last stage is switched off so the two runs share a path.)
+        stopped = _crossings(self.run_with(step_decay=1.0, polish=False))
+        stepped = _crossings(self.run_with(step_decay=0.25, min_step=0.001,
+                                           polish=False))
+        self.assertLessEqual(stepped, stopped)
+
+    def test_step_decay_of_one_matches_a_step_that_cannot_shrink(self):
+        off = self.run_with(step_decay=1.0)
+        floor = self.run_with(step_decay=0.25, min_step=0.05)
+        for a, b in zip(off, floor):
+            self.assertTrue(np.allclose(a.vertices, b.vertices))
+
+    def test_limit_still_holds_while_stepping_down(self):
+        meshes = self.MESHES()
+        results = self.run_with(step_decay=0.25, min_step=0.001)
+        for mesh, result in zip(meshes, results):
+            moved = np.linalg.norm(result.vertices - mesh.vertices, axis=1)
+            self.assertLessEqual(moved.max(), 0.2 + 1e-9)
+
+    def test_last_stage_never_ends_with_more_crossings(self):
+        # The last stage starts from the best state, so it can only improve.
+        without = _crossings(self.run_with(step_decay=0.25, min_step=0.05,
+                                           polish=False))
+        with_it = _crossings(self.run_with(step_decay=0.25, min_step=0.05,
+                                           polish=True, polish_step=0.01))
+        self.assertLessEqual(with_it, without)
+
+    def test_last_stage_keeps_the_movement_limit(self):
+        meshes = self.MESHES()
+        results = self.run_with(step_decay=0.25, min_step=0.05, polish=True,
+                                polish_step=0.01)
+        for mesh, result in zip(meshes, results):
+            moved = np.linalg.norm(result.vertices - mesh.vertices, axis=1)
+            self.assertLessEqual(moved.max(), 0.2 + 1e-9)
+
+    def test_command_accepts_the_step_down_options(self):
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder)
+            for name, mesh in (("a.ply", _sphere(1.0)),
+                               ("b.ply", _sphere(1.0, (1.9, 0, 0)))):
+                pymesh.save_mesh(str(folder / name), mesh)
+            for extra in (["--no-step-down"], ["--no-polish"],
+                          ["--polish-step", "0.005"],
+                          ["--step-decay", "0.5", "--min-step", "0.001"]):
+                PM.main([str(folder / "a.ply"), str(folder / "b.ply"),
+                         "-o", str(folder / "out"), "-s", "0.02", "-l", "0.3"]
+                        + extra)
+            self.assertEqual(len(list((folder / "out").iterdir())), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

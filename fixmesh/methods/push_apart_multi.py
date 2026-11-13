@@ -14,6 +14,19 @@ makes it worse. So which surface sits inside which is worked out first, and:
     self crossing, or surfaces side by side: both walls retreat inward
     one surface inside the other: inner goes inward, outer goes outward
 
+When the crossing count stops improving, the push is not given up: it goes back
+to the best state and carries on with a smaller step (by default a quarter of
+the last one, down to `min_step`). Near the end the overlaps are far thinner
+than a step, so a big step clears some crossings and re-creates others, and
+the count seesaws; smaller steps let it settle.
+
+Smaller steps eventually stop helping, because the smoothing that keeps the
+surface from denting also pulls the accumulated movement back: it can never
+grow past about three steps, so a tiny step can't clear an overlap deeper than
+that. So the last stage switches the smoothing off. Only the vertices on the
+few crossings that are left move, and they keep moving until they have cleared
+the overlap.
+
 No faces are removed or added, so every surface keeps its own triangles.
 Crossings that can't be separated within the movement limit are left in place
 and reported; cut_repair isn't used because it works on a single surface.
@@ -97,7 +110,9 @@ def push_apart_multi_repair(meshes, names=None, step=0.2, rings=3,
                             smoothing_iterations=3, max_displacement=3.0,
                             max_iters=300, patience=15, flip_squashed=True,
                             squashed_angle=2.0, units="mm", verbose=False,
-                            output_paths=None):
+                            output_paths=None, step_decay=0.25,
+                            min_step=0.005, polish=True, polish_step=0.01,
+                            polish_patience=60):
     """Push surfaces apart until they no longer cross each other or themselves.
 
     Args:
@@ -113,8 +128,23 @@ def push_apart_multi_repair(meshes, names=None, step=0.2, rings=3,
             mm (or median edge lengths). Both walls move, so two surfaces can
             separate by up to twice this.
         max_iters (int): Maximum push iterations.
-        patience (int): Stop pushing after this many iterations without a
-            new lowest crossing count.
+        patience (int): After this many iterations without a new lowest
+            crossing count, go back to the best state and use a smaller step
+            (see `step_decay`); stop if the step can't get any smaller.
+        step_decay (float): What the step is multiplied by each time the count
+            stalls. 1 turns this off, so the push simply stops after
+            `patience` stalled iterations.
+        min_step (float): The step never goes below this, in the same units
+            as `step`.
+        polish (bool): When the steps can't get any smaller and crossings
+            remain, run a last stage with the smoothing switched off (see the
+            module description).
+        polish_step (float): Step of that last stage, in the same units as
+            `step` (never larger than the step it follows).
+        polish_patience (int): Iterations without a new lowest count that end
+            the last stage. Longer than `patience`, because with no smoothing
+            the movement grows steadily but a crossing only clears once it
+            has grown as deep as the overlap.
         flip_squashed (bool): Last step: flip the edges of squashed
             triangles so TetGen accepts the surfaces. Nothing moves; a flip
             that makes faces cross is undone.
@@ -154,40 +184,80 @@ def push_apart_multi_repair(meshes, names=None, step=0.2, rings=3,
     print("Starting push...", flush=True)
     start = time.time()
 
+    # `base` is the movement already banked (the best state when the step was
+    # last made smaller); `displacement` is the movement since then. The
+    # smoothing below acts on `displacement` only, so after a step-down it
+    # works on small new pushes, not on the whole accumulated movement.
+    base = np.zeros_like(original)
     displacement = np.zeros_like(original)
-    best, best_displacement, stale = None, displacement.copy(), 0
+    best, best_displacement, stale = None, base.copy(), 0
+    current_step, steps_used = step, [step]
+    smoothing_now, polished = smoothing_iterations, False
     for iteration in range(1, max_iters + 1):
-        vertices = original + displacement
+        vertices = original + base + displacement
         pairs = _detect(vertices, faces)
         if best is None or len(pairs) < best:
-            best, best_displacement, stale = (len(pairs), displacement.copy(),
-                                              0)
+            best, best_displacement, stale = (
+                len(pairs), base + displacement, 0)
         else:
             stale += 1
         if iteration == 1:
             initial = _count_by_pair(pairs, labels, names)
             print(f"Crossings at the start: {initial or 'none'}", flush=True)
         if verbose:
-            moved = np.linalg.norm(displacement, axis=1)
+            moved = np.linalg.norm(base + displacement, axis=1)
             print(f"Push {iteration}: {len(pairs):,} crossings "
                   f"{_count_by_pair(pairs, labels, names)}, max move "
                   f"{moved.max():.3f}", flush=True)
-        if len(pairs) == 0 or stale >= patience:
+        if len(pairs) == 0:
+            break
+        if stale >= (polish_patience if polished else patience):
+            if (not polished and step_decay < 1.0
+                    and current_step * step_decay >= min_step):
+                # Stalled: bank the best state and take smaller steps from it.
+                current_step *= step_decay
+                steps_used.append(current_step)
+                base = best_displacement.copy()
+                displacement = np.zeros_like(original)
+                stale = -1  # the best state is counted again next round
+                print(f"Stalled at {best:,} crossings after round "
+                      f"{iteration}; back to the best state, step now "
+                      f"{current_step:g}", flush=True)
+                continue
+            if polish and not polished:
+                # Last stage: no smoothing, so the movement on the vertices
+                # of the few crossings left can grow until they have cleared.
+                polished, smoothing_now = True, 0
+                current_step = min(polish_step, current_step)
+                steps_used.append(current_step)
+                base = best_displacement.copy()
+                displacement = np.zeros_like(original)
+                stale = -1
+                print(f"Stalled at {best:,} crossings after round "
+                      f"{iteration}; last stage: smoothing off, step "
+                      f"{current_step:g}", flush=True)
+                continue
             break
 
         inward, outward = _push_directions(pairs, faces, labels, inside)
         normals = _vertex_normals(vertices, faces) * sign[:, None]
-        displacement[inward] -= step * scale * normals[inward]
-        displacement[outward] += step * scale * normals[outward]
-        # Re-spreads the running total, as in push_apart_repair.
+        displacement[inward] -= current_step * scale * normals[inward]
+        displacement[outward] += current_step * scale * normals[outward]
+        # Re-spreads the running movement, as in push_apart_repair.
         displacement = _spread(displacement, inward | outward, adjacency,
-                               degree, rings, smoothing_iterations)
-        displacement = _cap(displacement, limit)
+                               degree, rings, smoothing_now)
+        # The limit is on the total movement from the original surface.
+        displacement = _cap(base + displacement, limit) - base
 
     repaired = original + best_displacement
     moved = np.linalg.norm(best_displacement, axis=1)
     print(f"Pushing done in {time.time() - start:.1f}s ({iteration} rounds).",
           flush=True)
+    if len(steps_used) > 1:
+        print("  Steps used: " + " -> ".join(f"{s:g}" for s in steps_used)
+              + " (smaller each time the count stalled"
+              + ("; the last stage had no smoothing)" if polished else ")"),
+              flush=True)
     for k, name in enumerate(names):
         mine = moved[starts[k]:starts[k + 1]]
         shifted = mine[mine > 1e-9]
@@ -248,6 +318,23 @@ def main(argv=None):
                         metavar="DEG",
                         help="Triangles with a corner under DEG degrees get "
                              "flipped (default 2).")
+    parser.add_argument("--no-step-down", action="store_true",
+                        help="Don't switch to a smaller step when the "
+                             "crossing count stalls; just stop.")
+    parser.add_argument("--step-decay", type=float, default=0.25,
+                        metavar="FACTOR",
+                        help="What the step is multiplied by each time the "
+                             "count stalls (default 0.25).")
+    parser.add_argument("--min-step", type=float, default=0.005,
+                        help="The step never goes below this, in the same "
+                             "units as --step (default 0.005).")
+    parser.add_argument("--no-polish", action="store_true",
+                        help="Skip the last stage (smoothing off) that "
+                             "clears the few crossings left once the steps "
+                             "can't get smaller.")
+    parser.add_argument("--polish-step", type=float, default=0.01,
+                        help="Step of that last stage, in the same units as "
+                             "--step (default 0.01).")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Print a line for every round, not just the "
                              "summaries.")
@@ -267,6 +354,9 @@ def main(argv=None):
         [pymesh.load_mesh(path) for path in args.inputs],
         names=[os.path.splitext(name)[0] for name in base_names],
         step=args.step, max_displacement=args.limit,
+        step_decay=1.0 if args.no_step_down else args.step_decay,
+        min_step=args.min_step, polish=not args.no_polish,
+        polish_step=args.polish_step,
         flip_squashed=not args.no_flip, squashed_angle=args.squashed_angle,
         units="edge" if args.edge_units else "mm", verbose=args.verbose,
         output_paths=[os.path.join(args.output_dir, "push_apart_" + name)
